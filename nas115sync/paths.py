@@ -119,6 +119,8 @@ class MappingFilter:
         parts = key.split("/")
         if self.exclude and self._hit(self.exclude, key, parts):
             return False
+        if self.skip_hidden and any(p.startswith(".") for p in parts):  # 115 端沒有隱藏屬性，以 . 開頭判斷
+            return False
         if self.include and not self._hit(self.include, key, parts[-1:]):
             return False
         if size is not None:

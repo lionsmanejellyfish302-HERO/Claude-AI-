@@ -306,3 +306,12 @@ def test_scheduler_runs_sync(env):
     env.write("scheduled.txt", "x")
     stats = sch.run_schedule(s)
     assert stats["uploaded"] == 1 and "scheduled.txt" in env.cloud_files()
+
+
+def test_download_mode_skip_hidden_creates_no_hidden_dirs(env):
+    set_mode(env, DOWNLOAD, skip_hidden=True)
+    env.cloud.put_file(f"{ROOT}/.cache/x.bin", b"x")
+    env.cloud.put_file(f"{ROOT}/ok/y.txt", b"y")
+    env.sync()
+    assert (env.nas / "ok/y.txt").exists()
+    assert not (env.nas / ".cache").exists()

@@ -498,7 +498,10 @@ class Planner:
         return plan
 
     def _dir_allowed(self, m: Mapping, d: str) -> bool:
-        if self.ignore.match_rel(d) or self.db.is_ignored(m.id, norm_key(d)) or self.filter_for(m).excludes_dir(d):
+        filt = self.filter_for(m)
+        if self.ignore.match_rel(d) or self.db.is_ignored(m.id, norm_key(d)) or filt.excludes_dir(d):
+            return False
+        if filt.skip_hidden and any(part.startswith(".") for part in d.split("/")):
             return False
         # 以資料夾內的虛擬檔名判斷此資料夾是否屬於尚未核可的存檔群組
         group, status = self.savedata_status(m, d + "/x")

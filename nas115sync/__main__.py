@@ -184,7 +184,9 @@ def cmd_schedule(app, args) -> int:
 
     s = app.config.settings
     if args.action == "add":
-        days = [int(d) for d in args.days.split(",")] if args.days else None
+        days = sorted({int(d) for part in args.days for d in part.split(",") if d.strip()}) if args.days else None
+        if days is not None and any(d < 0 or d > 6 for d in days):
+            raise SystemExit("星期請用 0（一）到 6（日）")
         s.schedules.append(new_schedule(args.time, days, args.action_type))
         app.config.save()
     elif args.action == "remove":
@@ -445,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     ssub.add_parser("list")
     q = ssub.add_parser("add")
     q.add_argument("time", help="HH:MM，例如 03:00")
-    q.add_argument("--days", help="星期（0=一 … 6=日，逗號分隔），預設每天")
+    q.add_argument("--days", nargs="+", help="星期（0=一 … 6=日），例如 0,2,4 或 0 2 4；預設每天")
     q.add_argument("--action-type", choices=["sync", "scan"], default="sync")
     q = ssub.add_parser("remove")
     q.add_argument("id")

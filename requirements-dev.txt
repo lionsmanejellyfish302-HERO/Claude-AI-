@@ -1,3 +1,5 @@
 -r requirements.txt
 pytest>=7
 pyinstaller>=6
+bandit>=1.7      # 程式碼資安靜態分析
+pip-audit>=2.7   # 相依套件已知漏洞檢查

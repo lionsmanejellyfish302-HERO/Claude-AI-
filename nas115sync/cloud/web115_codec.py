@@ -40,17 +40,21 @@ _RSA_BLOCK = 128
 
 
 # --------------------------------------------------------------------------- AES + LZ4
-def aes_encrypt(data: bytes) -> bytes:
-    from Crypto.Cipher import AES
+def _cipher():
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+    return Cipher(algorithms.AES(_AES_KEY), modes.CBC(_AES_IV))
+
+
+def aes_encrypt(data: bytes) -> bytes:
     pad = -len(data) % 16  # 115 的補齊方式：剛好是 16 的倍數時不補
-    return AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).encrypt(data + bytes([pad]) * pad)
+    enc = _cipher().encryptor()
+    return enc.update(data + bytes([pad]) * pad) + enc.finalize()
 
 
 def aes_decrypt(data: bytes) -> bytes:
-    from Crypto.Cipher import AES
-
-    out = AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).decrypt(data[: len(data) // 16 * 16])
+    dec = _cipher().decryptor()
+    out = dec.update(data[: len(data) // 16 * 16]) + dec.finalize()
     pad = out[-1] if out else 0
     if 0 < pad < 16 and out.endswith(bytes([pad]) * pad):
         out = out[:-pad]
@@ -123,6 +127,14 @@ def maybe_decrypt(content: bytes) -> bytes:
 
 
 # --------------------------------------------------------------------------- 上傳簽章
+def _sha1(b: bytes) -> str:  # 115 協定規定的簽章算法，不是本程式用來保護資料的雜湊
+    return hashlib.sha1(b, usedforsecurity=False).hexdigest()
+
+
+def _md5(b: bytes) -> str:
+    return hashlib.md5(b, usedforsecurity=False).hexdigest()
+
+
 def ec_token(ts: int) -> str:
     tok = bytearray(_EC_PUBKEY[:15])
     tok += b"\x00s\x00\x00\x00"
@@ -140,12 +152,12 @@ def sign_upload(fields: dict, userkey: str, ts: int) -> tuple[dict, bytes]:
     p.setdefault("sign_val", "")
     p["userkey"] = userkey
     p["t"] = ts
-    inner = hashlib.sha1(f"{p['userid']}{p['fileid']}{p['target']}0".encode("ascii")).hexdigest()
-    p["sig"] = hashlib.sha1(userkey.encode("ascii") + inner.encode("ascii") + b"000000").hexdigest().upper()
-    uid_md5 = hashlib.md5(str(int(p["userid"])).encode("ascii")).hexdigest()
+    inner = _sha1(f"{p['userid']}{p['fileid']}{p['target']}0".encode("ascii"))
+    p["sig"] = _sha1(userkey.encode("ascii") + inner.encode("ascii") + b"000000").upper()
+    uid_md5 = _md5(str(int(p["userid"])).encode("ascii"))
     raw = (f"{p['fileid']}{p['filesize']}{p['sign_key']}{p['sign_val']}{p['userid']}{ts}{uid_md5}"
            f"{p['appversion']}")
-    p["token"] = hashlib.md5(_MD5_SALT + raw.encode("ascii")).hexdigest()
+    p["token"] = _md5(_MD5_SALT + raw.encode("ascii"))
     body = urlencode(sorted((k, v) for k, v in p.items() if v)).encode("latin-1")
     return {"k_ec": ec_token(ts)}, aes_encrypt(body)
 

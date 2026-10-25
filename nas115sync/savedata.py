@@ -42,6 +42,13 @@ class SavedataDetector:
         return bool(parts) and name_key(parts[-1]) in self.dir_names
 
 
+def system_exe(name: str) -> str:
+    """Windows 系統程式的完整路徑（不依賴目前資料夾與 PATH 搜尋順序）。"""
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    sub = "" if name.lower() == "explorer.exe" else "System32"
+    return os.path.join(root, sub, name) if sub else os.path.join(root, name)
+
+
 def running_process_names() -> set[str]:
     """目前執行中的程序名稱（小寫）。優先用 psutil，否則 Windows 用 tasklist。"""
     try:
@@ -53,7 +60,7 @@ def running_process_names() -> set[str]:
     try:
         if sys.platform == "win32":
             out = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, errors="replace",
+                [system_exe("tasklist.exe"), "/FO", "CSV", "/NH"], capture_output=True, text=True, errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=15,
             ).stdout
             return {row[0].casefold() for row in csv.reader(io.StringIO(out)) if row}

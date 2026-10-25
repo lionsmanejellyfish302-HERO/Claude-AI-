@@ -17,8 +17,8 @@ from .compare import (CLOUD_DUPS, ERROR, KIND_LABELS, REGENERATED_KINDS, SAVEDAT
 from .config import Config, Mapping
 from .db import CloudRow, Database, LocalRow
 from .hashing import FileHashes, HashCancelled, hash_file
-from .paths import (cloud_join, cloud_parts, local_join, long_path, nfc, norm_key, rel_join, rel_name,
-                    rel_parent)
+from .paths import (cloud_join, cloud_parts, is_inside, local_join, long_path, nfc, norm_key, rel_join, rel_name,
+                    rel_parent, unsafe_name)
 from .savedata import any_running
 from .transfers import Cancelled, TransferControl, TransferManager
 
@@ -88,6 +88,7 @@ class SyncEngine:
         self.cancel_event = threading.Event()
         self.listeners: list[Callable[[str, dict], None]] = []
         self.last_plans: list[Plan] = []
+        self.unsafe_cloud: dict[str, dict[str, str]] = {}  # 115 上不能安全放到 NAS 的名稱（依對應）
         self.full_lock = threading.Lock()  # 完整比對／執行不重疊（排程、定期比對、手動）
         self._dir_lock = threading.RLock()
         self._busy_lock = threading.Lock()
@@ -287,6 +288,13 @@ class SyncEngine:
         files, dirs = [], []
         for e in entries:
             child = rel_join(rel, e.name)
+            why = unsafe_name(e.name)
+            if why:  # 不能安全地放到 NAS 上的名稱（可能寫到資料夾以外或覆蓋別的檔案）：略過
+                skipped = self.unsafe_cloud.setdefault(m.id, {})
+                if child not in skipped:
+                    log.warning("略過 115 上的「%s」：%s", child, why)
+                skipped[child] = why
+                continue
             if ignore.match_rel(child):
                 continue
             if e.is_dir:
@@ -298,7 +306,8 @@ class SyncEngine:
     def _skip_cloud_dir(self, m: Mapping):
         planner = self.planner()
         filt = planner.filter_for(m)
-        return lambda rel: planner.ignore.match_rel(rel) or filt.excludes_dir(rel)
+        return lambda rel: (planner.ignore.match_rel(rel) or filt.excludes_dir(rel)
+                            or unsafe_name(rel_name(rel)) is not None)
 
     def scan_cloud(self, m: Mapping, progress: ProgressFn | None = None) -> int:
         root = self.resolve_root(m)
@@ -444,6 +453,9 @@ class SyncEngine:
         same = os.path.normcase(src) == os.path.normcase(dst)
         if not os.path.exists(src) or (os.path.exists(dst) and not same) or os.path.isdir(src) != is_dir:
             return False
+        if not is_inside(m.local_path, dst):
+            log.warning("拒絕搬移到 NAS 資料夾以外的位置：%s", new_rel)
+            return False
         if not is_dir:
             try:
                 st = os.stat(src)
@@ -496,6 +508,7 @@ class SyncEngine:
                 continue
             try:
                 self.purge_local_trash(m)
+                self.unsafe_cloud.pop(m.id, None)
                 _, dirs, bad, hidden = self.scan_local(m, progress)
                 self.scan_cloud(m, progress)
                 scanned.append((m, dirs, bad, hidden))
@@ -507,6 +520,10 @@ class SyncEngine:
         planner = self.planner()
         for m, dirs, bad, hidden in scanned:
             p = planner.plan_mapping(m, dirs, bad, hidden)
+            skipped = self.unsafe_cloud.get(m.id) or {}
+            if skipped:
+                p.warnings.append(f"115 上有 {len(skipped)} 個名稱無法安全放到 NAS（Windows），已略過："
+                                  + "、".join(list(skipped)[:5]) + ("…" if len(skipped) > 5 else ""))
             self._store_reviews(m, p, prune=True)
             plans.append(p)
         self.last_plans = plans
@@ -844,7 +861,7 @@ class SyncEngine:
         keep_old = (lambda: self._rename_local_aside(m, t.rel_path)) if t.keep_old else \
             (lambda: self._trash_local(m, t.rel_path))
         h, how = self.fetch_to(self.cloud_for(m), m.id, t.rel_path, t.fid, t.pick_code, t.sha1, t.size, dest,
-                               keep_old=keep_old)
+                               keep_old=keep_old, root=m.local_path)
         st = os.stat(lp)
         self.db.put_cached_hash(dest, st.st_mtime_ns, h)
         lf = self._local_row(m, t.rel_path, h, st)
@@ -860,9 +877,13 @@ class SyncEngine:
         return how
 
     def fetch_to(self, c: CloudClient, mapping_id: str, label: str, fid: str, pick_code: str, sha1: str, size: int,
-                 dest: str, keep_old: Callable[[], object] | None = None) -> tuple[FileHashes, str]:
+                 dest: str, keep_old: Callable[[], object] | None = None, root: str | None = None
+                 ) -> tuple[FileHashes, str]:
         """取得 115 檔案到 dest：先找 NAS 上相同 SHA-1 的檔案直接複製，否則下載（可續傳）；
-        完成後驗證 SHA-1，最後才取代目的地檔案（舊檔交給 keep_old 處理）。"""
+        完成後驗證 SHA-1，最後才取代目的地檔案（舊檔交給 keep_old 處理）。
+        root：dest 必須位於此資料夾內（防止 115 上的特殊名稱或 NAS 上的捷徑把檔案寫到別處）。"""
+        if root is not None and not is_inside(root, dest):
+            raise CloudError(f"拒絕寫入 {root} 以外的位置：{dest}")
         lp = long_path(dest)
         os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
         tmp = lp + ".115part"

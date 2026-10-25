@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import re
 import subprocess
 import sys
 import webbrowser
@@ -48,6 +49,22 @@ def single_instance(name: str) -> bool:
     return True
 
 
+_SECRET_RE = re.compile(
+    r"(?i)\b(UID|CID|SEID|KID|userkey|SecurityToken|AccessKeySecret|AccessKeyId|access_token|refresh_token)"
+    r"(\W{1,4})([^\s;,'\"&}]{6,})")
+
+
+class RedactSecrets(logging.Filter):
+    """寫入紀錄前遮蔽登入資訊與上傳憑證（多一層保險：程式本身不會記錄這些內容）。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        red = _SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "***", msg)
+        if red != msg:
+            record.msg, record.args = red, None
+        return True
+
+
 def setup_logging(verbose: bool = False) -> None:
     log_dir = app_home() / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -59,11 +76,13 @@ def setup_logging(verbose: bool = False) -> None:
     fh = logging.handlers.RotatingFileHandler(log_dir / "nas115sync.log", maxBytes=5_000_000, backupCount=5,
                                               encoding="utf-8")
     fh.setFormatter(fmt)
+    fh.addFilter(RedactSecrets())
     fh._nas115 = True  # type: ignore[attr-defined]
     root.addHandler(fh)
     if sys.stderr is not None:  # pythonw / 無主控台的 exe 沒有 stderr
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)
+        sh.addFilter(RedactSecrets())
         sh._nas115 = True  # type: ignore[attr-defined]
         root.addHandler(sh)
     for noisy in ("urllib3", "oss2", "watchdog"):

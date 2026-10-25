@@ -29,9 +29,9 @@ def hash_file(
     progress: Callable[[int], None] | None = None,
     cancel: threading.Event | None = None,
 ) -> FileHashes:
-    md5 = hashlib.md5()
-    sha1 = hashlib.sha1()
-    pre = hashlib.sha1()
+    md5 = hashlib.md5(usedforsecurity=False)
+    sha1 = hashlib.sha1(usedforsecurity=False)
+    pre = hashlib.sha1(usedforsecurity=False)
     pre_left = PREID_SIZE
     size = 0
     with open(long_path(path), "rb") as f:
@@ -56,9 +56,9 @@ def hash_file(
 def hash_bytes(data: bytes) -> FileHashes:
     return FileHashes(
         len(data),
-        hashlib.md5(data).hexdigest(),
-        hashlib.sha1(data).hexdigest().upper(),
-        hashlib.sha1(data[:PREID_SIZE]).hexdigest().upper(),
+        hashlib.md5(data, usedforsecurity=False).hexdigest(),
+        hashlib.sha1(data, usedforsecurity=False).hexdigest().upper(),
+        hashlib.sha1(data[:PREID_SIZE], usedforsecurity=False).hexdigest().upper(),
     )
 
 
@@ -66,7 +66,7 @@ def sha1_range(path: str, start: int, end: int) -> str:
     """115 二次驗證（sign_check "start-end"）：計算 [start, end]（含兩端）的 SHA-1。"""
     if end < start:
         raise ValueError(f"invalid range {start}-{end}")
-    h = hashlib.sha1()
+    h = hashlib.sha1(usedforsecurity=False)
     left = end - start + 1
     with open(long_path(path), "rb") as f:
         f.seek(start)

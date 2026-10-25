@@ -52,6 +52,8 @@ def run(out_dir: str, gui: bool = True, tab_seconds: float = 0.0) -> int:
         step("QR 碼", _qr)
         step("登入資訊加密保存（DPAPI）", lambda: _tokens(home))
         step("MD5/SHA-1 與超長路徑", lambda: _hashing(home))
+        step("115 通訊協定（秒傳簽章、加密、下載網址編碼）", _codec)
+        step("路徑安全（拒絕寫到 NAS 資料夾以外）", lambda: _path_safety(home))
         step("比對與雙向同步（模擬 115）", lambda: _sync(home, ctx))
         step("遊戲存檔核可與同步", lambda: _savedata(ctx))
         step("即時監看（NAS 變動自動上傳）", lambda: _realtime(ctx))
@@ -81,6 +83,7 @@ def _imports() -> dict:
     import sqlite3
     import tkinter
 
+    import cryptography
     import oss2
     import qrcode
     import requests
@@ -96,7 +99,8 @@ def _imports() -> dict:
             return "ok"
 
     _ = (qrcode, watchdog)
-    return {"requests": requests.__version__, "oss2": oss2.__version__, "watchdog": ver("watchdog"),
+    return {"requests": requests.__version__, "oss2": oss2.__version__, "cryptography": cryptography.__version__,
+            "watchdog": ver("watchdog"),
             "qrcode": ver("qrcode"), "sqlite": sqlite3.sqlite_version, "tk": tkinter.TkVersion,
             "observer": Observer.__name__}
 
@@ -135,9 +139,42 @@ def _hashing(home: str) -> dict:
     with open(long_path(path), "wb") as f:
         f.write(data)
     h = hash_file(path)
-    _check(h.sha1 == hashlib.sha1(data).hexdigest().upper(), "SHA-1 錯誤")
-    _check(h.md5 == hashlib.md5(data).hexdigest(), "MD5 錯誤")
+    _check(h.sha1 == hashlib.sha1(data, usedforsecurity=False).hexdigest().upper(), "SHA-1 錯誤")
+    _check(h.md5 == hashlib.md5(data, usedforsecurity=False).hexdigest(), "MD5 錯誤")
     return {"path_length": len(path), "sha1": h.sha1}
+
+
+def _codec() -> dict:
+    """打包後的 exe 也必須帶齊加密函式庫，且與參考實作的結果完全相同。"""
+    import hashlib
+
+    from .cloud import web115_codec as c
+
+    data = os.urandom(5000)
+    _check(c.aes_decrypt(c.aes_encrypt(data)) == data, "AES 加解密不一致")
+    _check(c.ec_token(1700000000) == "HQMOgKF43O7OzaN33hKNAHMAAAAA8VNljtndz1WuYe1G6hIaHPyBAAEAAACWHoRq",
+           "k_ec 與參考實作不同")
+    fields = {"appid": 0, "target": "U_1_0", "topupload": "true", "appversion": "36.2.28", "filename": "a.txt",
+              "fileid": "A" * 40, "filesize": 1048576, "path": "", "userid": 123456}
+    params, body = c.sign_upload(fields, "ABCDEF0123", 1792946228)
+    _check(params["k_ec"] == "HQMOgKF43O7OzaN33hKNAHMAAAA0MN5qjtndz1WuYe1G6hIaHPyBAAEAAAAr3yDm", "上傳簽章參數錯誤")
+    _check(hashlib.sha256(body).hexdigest() == "40f93fa025f06d2c4bc2cd4d50d9c0ec7597e3407d0cc80e0d2147dc04a589b1",
+           "上傳簽章內容與參考實作不同")
+    enc = c.m115_encode_json({"pickcode": "abc123"})
+    _check(len(enc) % 172 == 0, "下載網址編碼長度錯誤")
+    return {"aes": "ok", "upload_signature": "ok", "m115": len(enc)}
+
+
+def _path_safety(home: str) -> dict:
+    from .paths import is_inside, unsafe_name
+
+    root = os.path.join(home, "NAS")
+    for bad in ("..", "..\\..\\x.txt", "C:\\Windows\\x.dll", "a:b.txt", "CON", "結尾."):
+        _check(unsafe_name(bad) is not None, f"沒有擋下不安全的名稱：{bad!r}")
+    _check(unsafe_name("相片 (1).jpg") is None, "誤擋正常名稱")
+    _check(not is_inside(root, os.path.join(root, "..", "外面.txt")), "沒有擋下 .. 路徑")
+    _check(is_inside(root, os.path.join(root, "子", "x.txt")), "誤擋正常路徑")
+    return {"checked": True}
 
 
 def _sync(home: str, ctx: dict) -> dict:

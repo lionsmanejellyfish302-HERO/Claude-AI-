@@ -30,7 +30,9 @@ def open_local(path: str) -> None:
     """在檔案總管中開啟（檔案則選取它）。"""
     if sys.platform == "win32":
         if os.path.isfile(path):
-            subprocess.Popen(["explorer", "/select,", path])
+            from ..savedata import system_exe
+
+            subprocess.Popen([system_exe("explorer.exe"), "/select,", path])
         else:
             os.startfile(path if os.path.isdir(path) else os.path.dirname(path))  # type: ignore[attr-defined]
     else:

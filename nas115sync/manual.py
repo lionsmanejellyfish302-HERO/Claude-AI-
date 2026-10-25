@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .cloud.base import CloudClient, CloudEntry
 from .compare import KIND_LABELS, Plan
-from .paths import cloud_join, local_join, long_path, name_key, norm_key
+from .paths import cloud_join, local_join, long_path, name_key, norm_key, rel_join, rel_name, unsafe_name
 
 log = logging.getLogger(__name__)
 
@@ -109,13 +109,25 @@ def download_entries(engine, account_id: str, items: list[CloudEntry], local_dir
     c: CloudClient = engine.client(account_id)
     stats = {"downloaded": 0, "copied": 0, "skipped": 0, "failed": 0}
     jobs: list[tuple[CloudEntry, str]] = []
+
+    def safe(name: str, where: str) -> bool:
+        why = unsafe_name(name)
+        if why:  # 不能安全放到 NAS 上的名稱：不下載（避免寫到別的資料夾或覆蓋別的檔案）
+            log.warning("略過 115 上的「%s」：%s", where, why)
+            stats["failed"] += 1
+        return why is None
+
     for e in items:
+        if not safe(e.name, e.name):
+            continue
         if e.is_dir:
             base = os.path.join(local_dir, e.name)
-            for rel, _, entries in c.walk(e.fid, "", cancel=engine.cancel_event):
+            for rel, _, entries in c.walk(e.fid, "", skip_dir=lambda r: not safe(rel_name(r), r),
+                                          cancel=engine.cancel_event):
                 d = local_join(base, rel)
                 os.makedirs(long_path(d), exist_ok=True)
-                jobs += [(x, os.path.join(d, x.name)) for x in entries if not x.is_dir]
+                jobs += [(x, os.path.join(d, x.name)) for x in entries
+                         if not x.is_dir and safe(x.name, rel_join(rel, x.name))]
         else:
             jobs.append((e, os.path.join(local_dir, e.name)))
 
@@ -133,7 +145,8 @@ def download_entries(engine, account_id: str, items: list[CloudEntry], local_dir
                 dest = os.path.join(os.path.dirname(dest), _stamped(e.name, "115"))
             else:
                 keep_old = lambda: send_to_recycle_bin(dest)  # noqa: E731
-        h, how = engine.fetch_to(c, "", dest, e.fid, e.pick_code, e.sha1, e.size, dest, keep_old=keep_old)
+        h, how = engine.fetch_to(c, "", dest, e.fid, e.pick_code, e.sha1, e.size, dest, keep_old=keep_old,
+                                 root=local_dir)
         st = os.stat(long_path(dest))
         engine.db.put_cached_hash(dest, st.st_mtime_ns, h)
         engine.db.add_history("", "download(手動)", dest, True, how == "copied", h.size,
@@ -236,9 +249,16 @@ def export_plans_csv(engine, plans: list[Plan], path: str) -> int:
             out += [("暫時無法讀取", r, "", "") for r in p.unreadable]
             out += [("警告", "", "", w_) for w_ in p.warnings]
             for row in out:
-                w.writerow([lr, cr, *row])
+                w.writerow([_csv_safe(v) for v in (lr, cr, *row)])
                 rows += 1
     return rows
+
+
+def _csv_safe(v):
+    """以 = + - @ 開頭的文字前面加 '，避免 Excel 把檔名當成公式執行（CSV 公式注入）。"""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
 
 
 # ---------------------------------------------------------------- 資源回收筒

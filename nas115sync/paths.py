@@ -39,6 +39,42 @@ def local_join(root: str, rel_path: str) -> str:
     return os.path.join(root, *rel_path.split("/"))
 
 
+_BAD_CHARS = frozenset('<>:"/\\|?*') | frozenset(chr(i) for i in range(32))
+_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                       *(f"LPT{i}" for i in range(1, 10))})
+
+
+def unsafe_name(name: str) -> str | None:
+    """115 上的名稱不能安全地當成 NAS（Windows）上的檔名時，回傳原因；可以就回傳 None。
+
+    擋下：. 與 ..（會跳到上層資料夾）、路徑分隔符號與磁碟代號（會寫到別的地方）、
+    冒號（NTFS 隱藏資料流）、Windows 保留裝置名稱、結尾空白或句點（會與別的檔案變成同名）。
+    """
+    if not name or name in (".", ".."):
+        return "名稱是空的或是「.」「..」"
+    if any(c in _BAD_CHARS for c in name):
+        return "名稱含有 Windows 不允許的字元（< > : \" / \\ | ? * 或控制字元）"
+    if name[-1] in " .":
+        return "名稱結尾是空白或句點"
+    if name.split(".", 1)[0].rstrip(" ").upper() in _RESERVED:
+        return "名稱是 Windows 保留的裝置名稱"
+    return None
+
+
+def _plain(path: str) -> str:
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.realpath(path)).rstrip("\\/")
+
+
+def is_inside(root: str, path: str) -> bool:
+    """path 實際上（解析捷徑、符號連結、junction 之後）仍位於 root 底下。"""
+    r, p = _plain(long_path(root)), _plain(long_path(path))
+    return p == r or p.startswith(r + os.sep)
+
+
 def long_path(path: str) -> str:
     """Windows 超過 260 字元的路徑需加 \\\\?\\ 前綴才能存取。"""
     if sys.platform != "win32" or path.startswith("\\\\?\\"):

@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .. import __version__, autostart
-from ..app import App, make_client, open_in_115_browser, resource_path, single_instance
+from ..app import App, RedactSecrets, make_client, open_in_115_browser, resource_path, single_instance
 from ..compare import DECISIONS, KIND_LABELS, SAVEDATA_GROUP, available_decisions
 from ..config import DIRECTION_LABELS, Settings
 from ..engine import Cancelled
@@ -104,6 +104,7 @@ class MainWindow:
         self.statusbar.pack(fill="x")
 
         self._log_handler = QueueLogHandler(self.ui, self._append_log)
+        self._log_handler.addFilter(RedactSecrets())
         logging.getLogger().addHandler(self._log_handler)
         self.engine.listeners.append(lambda ev, data: self.ui.call(self._on_engine_event, ev, data))
         root.protocol("WM_DELETE_WINDOW", self._on_close)

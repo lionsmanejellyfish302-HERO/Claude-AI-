@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from .. import manual
 from ..app import open_in_115_browser
 from ..cloud.base import CloudEntry
-from ..paths import cloud_norm, name_key
+from ..paths import cloud_norm, name_key, unsafe_name
 from .util import fmt_time, human_size, open_local, tree_with_scroll
 
 STATUS = {"same": "＝ 相同", "different": "≠ 不同", "nas_only": "只在 NAS", "cloud_only": "只在 115"}
@@ -123,7 +123,9 @@ class BrowserTab:
         if not self.local_dir:
             return
         name = simpledialog.askstring("新資料夾", "資料夾名稱：", parent=self.win.root)
-        if name:
+        if name and (why := unsafe_name(name.strip())):
+            messagebox.showerror("名稱不能使用", why, parent=self.win.root)
+        elif name:
             try:
                 os.makedirs(os.path.join(self.local_dir, name.strip()), exist_ok=True)
             except OSError as e:
@@ -135,7 +137,9 @@ class BrowserTab:
         if len(sel) != 1:
             return
         new = simpledialog.askstring("重新命名", "新名稱：", initialvalue=os.path.basename(sel[0]), parent=self.win.root)
-        if new and new.strip() and new != os.path.basename(sel[0]):
+        if new and (why := unsafe_name(new.strip())):
+            messagebox.showerror("名稱不能使用", why, parent=self.win.root)
+        elif new and new.strip() and new != os.path.basename(sel[0]):
             dest = os.path.join(self.local_dir, new.strip())
             try:
                 if os.path.exists(dest) and os.path.normcase(dest) != os.path.normcase(sel[0]):

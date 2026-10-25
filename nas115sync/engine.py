@@ -415,6 +415,9 @@ class SyncEngine:
         except FileNotFoundError:
             log.info("檔案已不存在，略過：%s", abs_path)
             return SKIPPED
+        except FileChanging:
+            log.info("檔案仍在寫入，稍後再同步：%s", abs_path)
+            return SKIPPED
         lf = self._local_row(m, t.rel_path, h, st)
         self.db.put_local(lf)
         parent_rel, name = rel_parent(t.rel_path), rel_name(t.rel_path)

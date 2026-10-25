@@ -414,3 +414,17 @@ def test_cross_mapping_duplicate(env, tmp_path):
     env.sync()
     assert {(r.mapping_id, r.rel_path) for r in env.reviews(C.DUPLICATE)} == {
         (env.mapping.id, "dup.bin"), (m2.id, "dup.bin")}
+
+
+def test_file_still_being_written_is_skipped_not_failed(env, monkeypatch):
+    from nas115sync import engine as E
+
+    env.write("growing.bin", b"partial")
+
+    def changing(*a, **k):
+        raise E.FileChanging("growing.bin")
+
+    monkeypatch.setattr(env.engine, "hash_cached", changing)
+    t = C.UploadTask(env.mapping.id, "growing.bin", "new")
+    assert env.engine.upload_task(env.mapping, t) is E.SKIPPED
+    assert env.reviews(C.ERROR) == []

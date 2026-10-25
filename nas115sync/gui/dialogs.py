@@ -278,20 +278,43 @@ class ConfirmMappingDialog(_Dialog):
 
 
 class QrLoginDialog(_Dialog):
+    """與 115 電腦版相同的登入方式：115 App 掃 QR 碼。可選擇使用哪一個「登入裝置欄位」。"""
+
     def __init__(self, parent, cloud, ui):
+        from ..cloud.web115 import DEFAULT_DEVICE, LOGIN_DEVICES
+
         super().__init__(parent, "115 掃碼登入")
         self.cloud, self.ui = cloud, ui
         self._closed = threading.Event()
+        self._devices = LOGIN_DEVICES
         b = self.body
-        ttk.Label(b, text="請開啟手機 115 App 掃描 QR 碼，並在手機上確認授權。").pack()
+        ttk.Label(b, text="用手機 115 App 掃描 QR 碼並確認（與 115 電腦版是同一個帳號、同一個網盤）。",
+                  wraplength=400).pack(anchor="w")
+        row = ttk.Frame(b)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Label(row, text="登入裝置欄位：").pack(side="left")
+        self.device = ttk.Combobox(row, state="readonly", width=34, values=list(LOGIN_DEVICES.values()))
+        self.device.set(LOGIN_DEVICES.get(getattr(cloud, "device", DEFAULT_DEVICE), LOGIN_DEVICES[DEFAULT_DEVICE]))
+        self.device.pack(side="left")
+        ttk.Label(b, text="115 每種裝置只允許一個登入：請選你「沒有在用」的裝置，否則該裝置上的 115 會被登出。\n"
+                          "預設的「支付寶小程序」不會影響 115 電腦版與手機 App。",
+                  foreground="#a05000", wraplength=400).pack(anchor="w", pady=(4, 0))
+        self.start_btn = ttk.Button(b, text="顯示 QR 碼", command=self.start)
+        self.start_btn.pack(pady=(8, 0))
         self.canvas = tk.Canvas(b, width=300, height=300, bg="white", highlightthickness=0)
         self.canvas.pack(pady=10)
-        self.status = ttk.Label(b, text="取得 QR 碼中…")
+        self.status = ttk.Label(b, text="選好裝置欄位後按「顯示 QR 碼」")
         self.status.pack()
         ttk.Button(b, text="取消", command=self.close).pack(pady=(8, 0))
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.center(380, 440)
-        threading.Thread(target=self._run, daemon=True).start()
+        self.center(440, 560)
+
+    def start(self):
+        device = next((k for k, v in self._devices.items() if v == self.device.get()), None)
+        self.start_btn.configure(state="disabled")
+        self.device.configure(state="disabled")
+        self.status.configure(text="取得 QR 碼中…")
+        threading.Thread(target=self._run, args=(device,), daemon=True).start()
 
     def close(self):
         self._closed.set()
@@ -322,11 +345,11 @@ class QrLoginDialog(_Dialog):
         if self.winfo_exists():
             self.status.configure(text=msg)
 
-    def _run(self):
-        from ..cloud.open115 import QR_CONFIRMED, QR_SCANNED
+    def _run(self, device):
+        from ..cloud.web115 import QR_CONFIRMED, QR_SCANNED
 
         try:
-            login = self.cloud.start_qr_login()
+            login = self.cloud.start_qr_login(device)
             self.ui.call(self._draw, login.qrcode)
             self.ui.call(self._set, "等待掃描…")
             while not self._closed.is_set():

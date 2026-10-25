@@ -5,6 +5,7 @@
 - 已核可的存檔群組：最後一次變動後靜置 savedata_quiet_seconds，且指定的遊戲程序已結束，才整組上傳
   （模擬 Steam 在遊戲結束後同步雲存檔）
 - NAS 根目錄無法存取時（離線）暫停處理，絕不把離線誤判成刪除
+- 115 端（115 電腦版、App、網頁）的變動：定期讀取 115「操作紀錄」，只重新讀取受影響的資料夾並同步到 NAS
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from .cloud.base import CloudChange, CloudError
 from .config import Mapping
 from .engine import Cancelled, FileChanging, SyncEngine
 from .paths import local_join, long_path
@@ -63,6 +65,9 @@ class RealtimeSync:
         self._watches: dict[str, object] = {}
         self._next_watch_check = 0.0
         self._next_cloud_poll = 0.0
+        self._next_change_poll = 0.0
+        self._cursors: dict[str, str | None] = {}  # 每個 115 帳號的操作紀錄位置
+        self._recent_seen: dict[str, int] = {}  # 不支援操作紀錄時：每個對應最近看過的修改時間
         self.running = False
 
     # ------------------------------------------------------------ 啟動／停止
@@ -82,6 +87,7 @@ class RealtimeSync:
         self._pool = ThreadPoolExecutor(max(1, s.upload_workers), thread_name_prefix="sync")
         self._save_pool = ThreadPoolExecutor(1, thread_name_prefix="savedata")
         self._next_rescan = time.time() if initial_rescan else time.time() + s.rescan_interval_minutes * 60
+        self._cursors, self._recent_seen, self._next_change_poll = {}, {}, 0.0
         self._thread = threading.Thread(target=self._loop, name="realtime", daemon=True)
         self._thread.start()
         self.running = True
@@ -228,6 +234,10 @@ class RealtimeSync:
             self._next_cloud_poll = now + max(30, s.savedata_cloud_poll_seconds)
             self._poll_cloud_savedata()
 
+        if now >= self._next_change_poll:
+            self._next_change_poll = now + max(10, s.cloud_poll_seconds)
+            self._poll_cloud_changes()
+
         if now >= self._next_rescan and not self._rescan_running.is_set() and not self.engine.full_lock.locked():
             self._next_rescan = now + max(1, s.rescan_interval_minutes) * 60
             self._rescan_running.set()
@@ -319,6 +329,46 @@ class RealtimeSync:
                 if g.status != "approved" or key in self._inflight or (m.id, g.rel_dir) in self._dirty_groups:
                     continue
                 self._submit(self._save_pool, key, self.engine.sync_savedata_group, m, g.rel_dir)
+
+    def _poll_cloud_changes(self) -> None:
+        """115 端的變動（在 115 電腦版、App 或網頁上新增、修改、改名、搬移、刪除）同步到 NAS。"""
+        mappings = [m for m in self.config.active_mappings() if m.can_download and self.engine.local_root_ok(m)]
+        for aid in sorted({m.account_id for m in mappings}):
+            key = ("cloud-changes", aid)
+            if key in self._inflight:
+                continue
+            client = self.engine.client(aid)
+            try:
+                changes, cursor = client.changes(self._cursors.get(aid))
+                self._cursors[aid] = cursor
+            except NotImplementedError:
+                changes = self._recent_changes(client, [m for m in mappings if m.account_id == aid])
+            except CloudError as e:
+                log.warning("讀取 115 操作紀錄失敗（稍後重試）：%s", e)
+                continue
+            if changes:
+                self._submit(self._pool, key, self.engine.apply_cloud_changes, aid, changes)
+
+    def _recent_changes(self, client, mappings: list[Mapping]) -> list[CloudChange]:
+        """備用方式：比對每個對應底下最近修改的檔案（偵測新增與修改；刪除由定期完整比對處理）。"""
+        out: list[CloudChange] = []
+        for m in mappings:
+            if not m.cloud_cid:
+                continue
+            try:
+                recent = client.recent_files(m.cloud_cid)
+            except (NotImplementedError, CloudError):
+                continue
+            newest = max((e.mtime for e in recent), default=0)
+            seen = self._recent_seen.get(m.id)
+            self._recent_seen[m.id] = max(newest, seen or 0)
+            if seen is None:
+                continue
+            for e in recent:
+                known = self.engine.db.cloud_file_by_fid(m.id, e.fid)
+                if e.mtime > seen or known is None or known.sha1 != e.sha1:
+                    out.append(CloudChange(e.fid, e.pid, "recent", e.name))
+        return out
 
     def _rescan(self) -> None:
         try:

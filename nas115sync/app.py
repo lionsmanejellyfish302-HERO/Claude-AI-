@@ -78,11 +78,15 @@ def make_client(config: Config, account_id: str, demo: bool = False) -> CloudCli
         from .cloud.fake import FakeCloud
 
         return FakeCloud(home / f"demo_cloud{suffix}.json")
-    from .cloud.open115 import Open115Client, TokenStore
+    from .cloud.tokens import TokenStore
+    from .cloud.web115 import Web115Client
 
+    old = home / f"tokens{suffix}.dat"  # 舊版（open.115.com）的登入資訊已不再使用：移除
+    if old.exists():
+        TokenStore(old).clear()
     s = config.settings
-    c = Open115Client(TokenStore(home / f"tokens{suffix}.dat"), client_id=s.client_id,
-                      min_interval=s.api_min_interval, part_size=max(5, s.part_size_mb) * 1024 * 1024)
+    c = Web115Client(TokenStore(home / f"login115{suffix}.dat"), min_interval=s.api_min_interval,
+                     part_size=max(5, s.part_size_mb) * 1024 * 1024)
     c.set_proxy(s.proxy)
     return c
 

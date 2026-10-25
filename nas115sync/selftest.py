@@ -111,7 +111,7 @@ def _qr() -> dict:
 
 
 def _tokens(home: str) -> dict:
-    from .cloud.open115 import TokenStore
+    from .cloud.tokens import TokenStore
 
     store = TokenStore(os.path.join(home, "tokens.dat"))
     store.save({"refresh_token": "SELFTEST-SECRET"})

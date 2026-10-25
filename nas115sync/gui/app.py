@@ -14,6 +14,7 @@ from ..app import App, make_client, open_in_115_browser, resource_path, single_i
 from ..compare import DECISIONS, KIND_LABELS, SAVEDATA_GROUP, available_decisions
 from ..config import DIRECTION_LABELS, Settings
 from ..engine import Cancelled
+from ..check115 import run_check
 from ..manual import export_plans_csv
 from ..paths import local_join, rel_parent
 from ..scheduler import WEEKDAYS, Scheduler, describe, new_schedule
@@ -30,7 +31,6 @@ GROUP_STATUS = {"pending": "待核對", "approved": "自動同步（Steam 雲存
 DANGEROUS = {"delete_cloud", "delete_all", "delete_extra", "upload_replace", "download_replace", "delete_local"}
 
 SETTING_FIELDS = [
-    ("client_id", "115 開放平台 AppID（client_id）", "str"),
     ("auto_update_linked", "已核對連結的檔案：NAS 修改後自動上傳新版並刪除 115 舊版", "bool"),
     ("deletion_policy", "一邊刪除檔案時（各對應可另外設定）", "choice",
      [("review", "交給本人核對"), ("auto", "自動同步刪除（115 進回收站／NAS 移到可復原資料夾）"), ("ignore", "不處理")]),
@@ -58,6 +58,7 @@ SETTING_FIELDS = [
     ("upload_workers", "同時上傳數", "int"),
     ("hash_workers", "同時計算 MD5/SHA-1 數", "int"),
     ("api_min_interval", "115 API 最小呼叫間隔（秒，避免被限流）", "float"),
+    ("cloud_poll_seconds", "即時同步：多久檢查一次 115 端（115 電腦版、App）的變動（秒）", "int"),
     ("part_size_mb", "大檔分片大小（MB）", "int"),
     ("browser_path", "115 瀏覽器執行檔（空白 = 自動尋找）", "str"),
     ("ignore_patterns", "忽略的檔名規則（每行一個，支援 * ?）", "lines"),
@@ -266,12 +267,11 @@ class MainWindow:
         self.acct_label.pack(side="left")
         self.btn_logout = ttk.Button(acct, text="登出", command=self.logout)
         self.btn_logout.pack(side="right")
-        self.btn_rt = ttk.Button(acct, text="貼上 refresh_token", command=self.login_token)
-        self.btn_rt.pack(side="right", padx=4)
+        ttk.Button(acct, text="115 連線測試", command=self.check_115).pack(side="right", padx=4)
         self.btn_qr = ttk.Button(acct, text="115 App 掃碼登入", command=self.login_qr)
         self.btn_qr.pack(side="right")
         if self.app.demo:
-            for b in (self.btn_logout, self.btn_rt, self.btn_qr):
+            for b in (self.btn_logout, self.btn_qr):
                 b.configure(state="disabled")
         self._fill_accounts()
 
@@ -374,33 +374,37 @@ class MainWindow:
         threading.Thread(target=work, daemon=True).start()
 
     def login_qr(self) -> None:
-        s = self.config.settings
-        if not s.client_id:
-            cid = simpledialog.askstring(
-                "115 開放平台 AppID",
-                "掃碼登入需要 115 開放平台（open.115.com）的 AppID。\n"
-                "請到 115 開放平台申請應用後填入 AppID；\n若已有 refresh_token，可改用「貼上 refresh_token」。",
-                parent=self.root)
-            if not cid:
-                return
-            s.client_id = cid.strip()
-            self.config.save()
-            self.settings_vars["client_id"].set(s.client_id)
-        cloud = self.cur_cloud
-        cloud.client_id = s.client_id
-        if QrLoginDialog(self.root, cloud, self.ui).modal():
-            messagebox.showinfo("登入成功", "已登入 115", parent=self.root)
+        if QrLoginDialog(self.root, self.cur_cloud, self.ui).modal():
+            messagebox.showinfo("登入成功", "已登入 115。建議按「115 連線測試」確認上傳、秒傳、下載都正常。",
+                                parent=self.root)
         self._refresh_account()
 
-    def login_token(self) -> None:
-        rt = simpledialog.askstring("貼上 refresh_token", "請貼上 115 開放平台的 refresh_token：", parent=self.root)
-        if not rt:
-            return
+    def check_115(self) -> None:
         cloud = self.cur_cloud
-        self.run_bg("登入 115", lambda: cloud.login_with_refresh_token(rt), lambda _: self._refresh_account())
+        if not self.app.demo and not cloud.is_logged_in():
+            messagebox.showwarning("尚未登入", "請先按「115 App 掃碼登入」", parent=self.root)
+            return
+        if not messagebox.askyesno(
+                "115 連線測試", "會在 115 建立一個「NAS115Sync連線測試」資料夾，實際測試上傳、秒傳、下載、改名，"
+                                "最後把整個測試資料夾刪除（進 115 回收站）。不會動到其他檔案。繼續？", parent=self.root):
+            return
+
+        def work():
+            return run_check(cloud, lambda name, ok, text: self.ui.call(
+                self._set_status, f"115 連線測試：{name} {'✔' if ok else '✘'}"))
+
+        def done(results):
+            text = "\n".join(f"{'✔' if ok else '✘'} {name}：{detail}" for name, ok, detail in results)
+            if all(ok for _n, ok, _d in results):
+                messagebox.showinfo("115 連線測試通過", text, parent=self.root)
+            else:
+                messagebox.showwarning("115 連線測試有項目失敗", text, parent=self.root)
+
+        self.run_bg("115 連線測試", work, done)
 
     def logout(self) -> None:
-        if messagebox.askyesno("登出", "確定要登出 115？（即時同步會停止）", parent=self.root):
+        if messagebox.askyesno("登出", "確定要登出 115？（即時同步會停止；本機保存的登入資訊會刪除）\n"
+                                     "也可以在 115 App 的「登入裝置管理」移除此裝置。", parent=self.root):
             if self.rt.running:
                 self.rt.stop()
             self.cur_cloud.logout()
@@ -981,7 +985,7 @@ class MainWindow:
         bar.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=10)
         ttk.Button(bar, text="儲存設定", style="Big.TButton", command=self.save_settings).pack(side="left")
         ttk.Button(bar, text="選擇 115 瀏覽器…", command=self._pick_browser).pack(side="left", padx=6)
-        ttk.Label(f, text="AppID、API 間隔、分片大小、代理在重新啟動程式後生效；即時同步相關設定在重新開始即時同步後生效。",
+        ttk.Label(f, text="API 間隔、分片大小、代理在重新啟動程式後生效；即時同步相關設定在重新開始即時同步後生效。",
                   foreground="#555").grid(row=row + 2, column=0, columnspan=2, sticky="w")
         self._build_schedules(f, row + 3)
         f.columnconfigure(1, weight=1)
@@ -1087,9 +1091,6 @@ class MainWindow:
             messagebox.showerror("設定格式錯誤", f"請檢查數字欄位：{e}", parent=self.root)
             return
         self.config.save()
-        for c in self.engine.clouds.values():
-            if hasattr(c, "client_id"):
-                c.client_id = s.client_id
         self.engine.transfers.set_limits(s.upload_limit_kb, s.download_limit_kb)
         if autostart.supported():
             try:

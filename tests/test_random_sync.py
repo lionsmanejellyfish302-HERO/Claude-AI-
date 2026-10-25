@@ -71,6 +71,17 @@ class World:
         self.env.cloud.put_file(f"{ROOT}/{rel}", data)
         self.written.add(hash_bytes(data).sha1)
 
+    def cloud_rename(self, src, dst):
+        if src == dst or self._cloud_entries(dst):
+            return
+        entries = self._cloud_entries(src)
+        if not entries:
+            return
+        parent = os.path.dirname(dst)
+        cid = self.env.cloud.ensure_path(ROOT + ("/" + parent if parent else ""))
+        self.env.cloud.move([entries[0].fid], cid)
+        self.env.cloud.rename(entries[0].fid, os.path.basename(dst))
+
     def cloud_delete(self, rel):
         for e in self._cloud_entries(rel):
             self.released.add(e.sha1)
@@ -81,15 +92,15 @@ class World:
         if mode in (UPLOAD, TWO_WAY):
             ops += ["local_write"] * 4 + ["local_delete", "local_rename"]
         if mode in (DOWNLOAD, TWO_WAY):
-            ops += ["cloud_write"] * 4 + ["cloud_delete"]
+            ops += ["cloud_write"] * 4 + ["cloud_delete", "cloud_rename"]
         if mode == UPLOAD:
             ops += ["cloud_write"]  # 雲端也可能被別人改
         if mode == DOWNLOAD:
             ops += ["local_write"]
         for _ in range(self.rng.randint(1, 4)):
             op = self.rng.choice(ops)
-            if op == "local_rename":
-                self.local_rename(self.rng.choice(PATHS), self.rng.choice(PATHS))
+            if op in ("local_rename", "cloud_rename"):
+                getattr(self, op)(self.rng.choice(PATHS), self.rng.choice(PATHS))
             else:
                 getattr(self, op)(self.rng.choice(PATHS))
 
@@ -150,8 +161,13 @@ def test_random_sync_never_loses_data(env, mode, policy, seed):
     env.config.settings.deletion_policy = policy
     env.config.save()
     w = World(env, rng)
+    cursor = env.cloud.changes(None)[1]
     for rnd in range(25):
         w.random_ops(mode)
+        if rng.random() < 0.5:  # 即時同步：只依 115 操作紀錄處理受影響的資料夾
+            changes, cursor = env.cloud.changes(cursor)
+            env.engine.apply_cloud_changes("default", changes)
+            w.check_no_loss(f"第 {rnd} 輪即時處理 115 變動後")
         env.sync()
         w.check_no_loss(f"第 {rnd} 輪同步後")
         w.resolve_some_reviews()

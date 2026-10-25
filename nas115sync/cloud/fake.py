@@ -13,7 +13,7 @@ from pathlib import Path
 from ..hashing import FileHashes, hash_bytes
 from ..paths import cloud_parts, long_path, name_key, nfc
 from ..transfers import TransferControl
-from .base import CloudClient, CloudEntry, CloudError, NotFoundError, SessionStore, UploadResult
+from .base import CloudChange, CloudClient, CloudEntry, CloudError, NotFoundError, SessionStore, UploadResult
 
 
 class FakeCloud(CloudClient):
@@ -30,6 +30,7 @@ class FakeCloud(CloudClient):
         self.instant_count = 0
         self.real_upload_count = 0
         self.api_calls = 0
+        self.events: list[dict] = []  # 模擬 115「操作紀錄」
         self._next = 1000
         self._lock = threading.RLock()
         if self.path and self.path.exists():
@@ -45,6 +46,10 @@ class FakeCloud(CloudClient):
             tmp.write_text(json.dumps({"nodes": self.nodes, "known_sha1": sorted(self.known_sha1),
                                        "next": self._next}, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, self.path)
+
+    def _event(self, kind: int, n: dict) -> None:
+        self.events.append({"id": len(self.events) + 1, "type": kind, "fid": n["fid"], "pid": n["pid"],
+                            "name": n["name"]})
 
     def _new_id(self) -> str:
         self._next += 1
@@ -91,6 +96,7 @@ class FakeCloud(CloudClient):
              "size": h.size, "sha1": h.sha1.upper(), "mtime": int(time.time())}
         self.nodes[n["fid"]] = n
         self.known_sha1.add(h.sha1.upper())
+        self._event(2, n)
         self._save()
         return n
 
@@ -117,6 +123,7 @@ class FakeCloud(CloudClient):
                 raise CloudError("資料夾已存在", 20004)
             n = {"fid": self._new_id(), "pid": str(pid), "name": nfc(name), "is_dir": True}
             self.nodes[n["fid"]] = n
+            self._event(17, n)
             self._save()
             return n["fid"]
 
@@ -128,7 +135,7 @@ class FakeCloud(CloudClient):
                 fid = todo.pop()
                 if fid in self.nodes and fid != "0":
                     todo.extend(c["fid"] for c in self._children(fid))
-                    del self.nodes[fid]
+                    self._event(22, self.nodes.pop(fid))
             self._save()
 
     def rename(self, fid: str, new_name: str) -> None:
@@ -137,6 +144,7 @@ class FakeCloud(CloudClient):
             if str(fid) not in self.nodes:
                 raise NotFoundError(f"檔案不存在 {fid}")
             self.nodes[str(fid)]["name"] = nfc(new_name)
+            self._event(24, self.nodes[str(fid)])
             self._save()
 
     def move(self, fids: list[str], to_cid: str) -> None:
@@ -147,6 +155,7 @@ class FakeCloud(CloudClient):
                 if str(fid) not in self.nodes:
                     raise NotFoundError(f"檔案不存在 {fid}")
                 self.nodes[str(fid)]["pid"] = str(to_cid)
+                self._event(6, self.nodes[str(fid)])
             self._save()
 
     def try_instant(self, local_path: str, cid: str, name: str, hashes: FileHashes) -> UploadResult | None:
@@ -197,17 +206,36 @@ class FakeCloud(CloudClient):
                 f.write(chunk)
         self.download_count += 1
 
+    def _under(self, cid: str) -> set[str]:
+        under = {str(cid)}
+        changed = True
+        while changed:  # cid 底下所有資料夾
+            changed = False
+            for n in self.nodes.values():
+                if n["is_dir"] and n["pid"] in under and n["fid"] not in under:
+                    under.add(n["fid"])
+                    changed = True
+        return under
+
+    def changes(self, cursor: str | None) -> tuple[list[CloudChange], str]:
+        with self._lock:
+            self.api_calls += 1
+            last = int(cursor or 0) if cursor is not None else len(self.events)
+            new = [CloudChange(e["fid"], e["pid"], str(e["type"]), e["name"]) for e in self.events if e["id"] > last]
+            return ([] if cursor is None else new), str(len(self.events))
+
+    def recent_files(self, cid: str, limit: int = 50) -> list[CloudEntry]:
+        with self._lock:
+            self.api_calls += 1
+            under = self._under(cid)
+            files = [n for n in self.nodes.values() if not n["is_dir"] and n["pid"] in under]
+            files.sort(key=lambda n: (n.get("mtime", 0), int(n["fid"])), reverse=True)
+            return [self._entry(n) for n in files[:limit]]
+
     def search(self, keyword: str, cid: str = "0", limit: int = 500) -> list[CloudEntry]:
         with self._lock:
             self.api_calls += 1
-            under = {str(cid)}
-            changed = True
-            while changed:  # cid 底下所有資料夾
-                changed = False
-                for n in self.nodes.values():
-                    if n["is_dir"] and n["pid"] in under and n["fid"] not in under:
-                        under.add(n["fid"])
-                        changed = True
+            under = self._under(cid)
             kw = name_key(keyword)
             hits = [n for n in self.nodes.values() if n["fid"] != "0" and n["pid"] in under and kw in name_key(n["name"])]
             return [self._entry(n) for n in hits[:limit]]

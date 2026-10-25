@@ -309,6 +309,10 @@ class Database:
         sql, args = _under("SELECT * FROM cloud_files WHERE mapping_id=?", mapping_id, rel_dir)
         return [self._cloud_row(r) for r in self._all(sql, args)]
 
+    def cloud_file_by_fid(self, mapping_id: str, fid: str) -> CloudRow | None:
+        r = self._one("SELECT * FROM cloud_files WHERE mapping_id=? AND fid=?", (mapping_id, str(fid)))
+        return self._cloud_row(r) if r else None
+
     def cloud_files(self, mapping_id: str) -> list[CloudRow]:
         return [self._cloud_row(r) for r in
                 self._all("SELECT * FROM cloud_files WHERE mapping_id=? ORDER BY rel_key", (mapping_id,))]
@@ -361,6 +365,10 @@ class Database:
             (mapping_id, norm_key(rel_path), rel_path, h.size, mtime_ns, h.md5, h.sha1,
              cloud_fid, cloud_sha1.upper(), time.time()),
         )
+
+    def states_by_cloud_fid(self, mapping_id: str, fid: str) -> list[StateRow]:
+        rows = self._all("SELECT * FROM sync_state WHERE mapping_id=? AND cloud_fid=?", (mapping_id, str(fid)))
+        return [StateRow(**dict(r)) for r in rows]
 
     def delete_state(self, mapping_id: str, rel_key: str) -> None:
         self._exec("DELETE FROM sync_state WHERE mapping_id=? AND rel_key=?", (mapping_id, rel_key))

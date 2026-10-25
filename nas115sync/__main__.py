@@ -2,7 +2,8 @@
 
   python -m nas115sync                      開啟圖形介面
   python -m nas115sync --demo gui           示範模式（模擬 115，不需帳號）
-  python -m nas115sync login --client-id ID 以 115 App 掃 QR 碼登入
+  python -m nas115sync login                用 115 App 掃 QR 碼登入（與 115 電腦版同一個帳號）
+  python -m nas115sync check                115 連線測試（上傳、秒傳、下載、改名、刪除）
   python -m nas115sync mapping add "\\\\NAS\\home\\Photos" "/備份/Photos"
   python -m nas115sync mapping confirm <ID> 本人核對路徑
   python -m nas115sync scan                 比對（不上傳），產生待核對清單
@@ -50,42 +51,52 @@ def _ask(prompt: str) -> bool:
 
 
 def cmd_login(app, args) -> int:
+    from .cloud.web115 import LOGIN_DEVICES, QR_CONFIRMED
+
     cloud = app.engine.client(args.account)
     if app.demo:
         print("示範模式不需要登入")
         return 0
-    if args.client_id:
-        app.config.settings.client_id = args.client_id
-        app.config.save()
-        cloud.client_id = args.client_id
-    if args.refresh_token:
-        cloud.login_with_refresh_token(args.refresh_token)
-    else:
-        from .cloud.open115 import QR_CONFIRMED
+    if args.device not in LOGIN_DEVICES:
+        print("可用的登入裝置欄位：")
+        for k, v in LOGIN_DEVICES.items():
+            print(f"  {k:12s} {v}")
+        return 2
+    login = cloud.start_qr_login(args.device)
+    print(f"登入裝置欄位：{LOGIN_DEVICES[args.device]}")
+    print("請用 115 App 掃描以下 QR 碼並在手機上確認：")
+    try:
+        import qrcode
 
-        login = cloud.start_qr_login()
-        print("請用 115 App 掃描以下 QR 碼並確認授權：")
-        try:
-            import qrcode
-
-            qr = qrcode.QRCode(border=1)
-            qr.add_data(login.qrcode)
-            qr.print_ascii(invert=True)
-        except ImportError:
-            print(login.qrcode)
-        while True:
-            status = cloud.poll_qr_status(login)
-            if status == QR_CONFIRMED:
-                break
-            if status < 0:
-                print("QR 碼已過期或取消，請重新執行 login")
-                return 1
-            if status == 1:
-                print("已掃描，請在手機上確認…")
-            time.sleep(1)
-        cloud.finish_qr_login(login)
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(login.qrcode)
+        qr.print_ascii(invert=True)
+    except ImportError:
+        print(login.qrcode)
+    while True:
+        status = cloud.poll_qr_status(login)
+        if status == QR_CONFIRMED:
+            break
+        if status < 0:
+            print("QR 碼已過期或取消，請重新執行 login")
+            return 1
+        if status == 1:
+            print("已掃描，請在手機上確認…")
+        time.sleep(1)
+    cloud.finish_qr_login(login)
     print(f"登入成功：{cloud.user_label()}")
     return 0
+
+
+def cmd_check(app, args) -> int:
+    from .check115 import run_check
+
+    cloud = app.engine.client(args.account)
+    print("115 連線測試（只在 115 建立一個測試資料夾，測完刪除）：")
+    results = run_check(cloud, lambda name, ok, text: print(f"  {'✔' if ok else '✘'} {name}：{text}"))
+    ok = all(r[1] for r in results)
+    print("全部通過" if ok else "有項目失敗，請查看上面的說明")
+    return 0 if ok else 1
 
 
 def cmd_whoami(app, args) -> int:
@@ -369,9 +380,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tab-seconds", type=float, default=0, help="（自我測試）每個分頁停留秒數")
     sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("login", help="登入 115 開放平台")
-    p.add_argument("--client-id", help="115 開放平台 AppID")
-    p.add_argument("--refresh-token", help="直接使用已取得的 refresh_token")
+    p = sub.add_parser("login", help="用 115 App 掃 QR 碼登入（與 115 電腦版相同的登入方式）")
+    p.add_argument("--device", default="alipaymini",
+                   help="登入裝置欄位（115 每種裝置只允許一個登入；預設 alipaymini，不影響 115 電腦版與手機 App）")
+    p.add_argument("--account", default="default", help="帳號 ID（多帳號時）")
+    p = sub.add_parser("check", help="115 連線測試：上傳、秒傳、下載、改名、刪除（只動測試資料夾）")
     p.add_argument("--account", default="default", help="帳號 ID（多帳號時）")
     sub.add_parser("whoami", help="顯示所有 115 帳號的登入狀態")
     p = sub.add_parser("accounts", help="管理多個 115 帳號")
@@ -465,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         return code
     setup_logging(args.verbose)
     app = build_app(demo=args.demo)
-    handlers = {"login": cmd_login, "whoami": cmd_whoami, "accounts": cmd_accounts, "mapping": cmd_mapping,
+    handlers = {"login": cmd_login, "check": cmd_check, "whoami": cmd_whoami, "accounts": cmd_accounts, "mapping": cmd_mapping,
                 "scan": cmd_scan, "sync": cmd_sync, "reviews": cmd_reviews, "decide": cmd_decide,
                 "watch": cmd_watch, "ls": cmd_ls, "search": cmd_search, "upload": cmd_upload,
                 "download": cmd_download, "dupes": cmd_dupes, "schedule": cmd_schedule,

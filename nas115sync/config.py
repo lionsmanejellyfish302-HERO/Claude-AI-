@@ -97,7 +97,6 @@ class Account:
 
 @dataclass
 class Settings:
-    client_id: str = ""  # 115 開放平台 AppID
     # 已核對連結（有同步基準）的檔案，之後 NAS 端修改時自動上傳新版並刪除雲端舊版
     auto_update_linked: bool = True
     # NAS 端刪除檔案時：review=本人核對 / auto=自動刪除雲端(進115回收站) / ignore=不處理
@@ -137,6 +136,8 @@ class Settings:
     # 下載覆蓋或刪除 NAS 檔案前，先把舊檔移到對應根目錄下的這個資料夾（可復原）
     local_trash_dir: str = ".nas115sync_trash"
     local_trash_days: int = 30
+    # 即時同步時多久檢查一次 115 端（115 電腦版、App、網頁）的變動並同步到 NAS（秒）
+    cloud_poll_seconds: int = 30
     # 雙向/下載模式的存檔群組多久檢查一次 115 是否有新存檔（秒）
     savedata_cloud_poll_seconds: int = 120
     # 排程：[{"id","enabled","time":"03:00","days":[0..6],"action":"sync"|"scan","mapping_ids":[]}]

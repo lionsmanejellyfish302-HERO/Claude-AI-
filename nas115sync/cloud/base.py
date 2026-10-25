@@ -1,4 +1,4 @@
-"""雲端客戶端介面。Open115Client（正式）與 FakeCloud（測試/示範）都實作此介面。"""
+"""雲端客戶端介面。Web115Client（正式，與 115 電腦版相同的介面）與 FakeCloud（測試/示範）都實作此介面。"""
 from __future__ import annotations
 
 import abc
@@ -35,6 +35,15 @@ class CloudEntry:
     sha1: str = ""
     pick_code: str = ""
     mtime: int = 0
+
+
+@dataclass
+class CloudChange:
+    """115 端的一筆變動（例如在 115 電腦版或 App 上新增、改名、刪除）。"""
+    fid: str
+    parent_id: str = ""
+    kind: str = ""
+    name: str = ""
 
 
 @dataclass
@@ -100,6 +109,14 @@ class CloudClient(abc.ABC):
     def search(self, keyword: str, cid: str = "0", limit: int = 500) -> list[CloudEntry]:
         """以檔名搜尋（cid 底下）。"""
         raise CloudError("此雲端不支援搜尋")
+
+    def changes(self, cursor: str | None) -> tuple[list[CloudChange], str]:
+        """cursor 之後在 115 端發生的變動；cursor=None 時只回傳目前位置。不支援時丟出 NotImplementedError。"""
+        raise NotImplementedError
+
+    def recent_files(self, cid: str, limit: int = 50) -> list[CloudEntry]:
+        """cid 底下（含子資料夾）最近修改的檔案，新到舊。不支援時丟出 NotImplementedError。"""
+        raise NotImplementedError
 
     def user_label(self) -> str:
         return ""

@@ -296,6 +296,10 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         if "家人帳號" in [a.label for a in w.config.accounts]:
             raise GuiError("刪除帳號失敗")
         d.click("－", within=w.tab_dashboard)  # 預設帳號不能刪除，只會提示
+        d.expect("115 連線測試通過")
+        d.click("115 連線測試", within=w.tab_dashboard)
+        if not any(t == "115 連線測試通過" and "✔ 秒傳" in m for _k, t, m in d.messages):
+            raise GuiError(f"115 連線測試沒有通過：{d.messages[-1:]}")
         d.click("前往待核對 →", within=w.tab_dashboard)
         if w.nb.select() != str(w.tab_reviews):
             raise GuiError("沒有切換到待核對頁")

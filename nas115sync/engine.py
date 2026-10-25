@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from typing import Callable, Iterator
 
-from .cloud.base import CloudClient, CloudError, NotFoundError, SessionStore, UploadResult
+from .cloud.base import CloudChange, CloudClient, CloudError, NotFoundError, SessionStore, UploadResult
 from .compare import (CLOUD_DUPS, ERROR, KIND_LABELS, REGENERATED_KINDS, SAVEDATA_GROUP, DownloadTask, Outcome,
                       Plan, Planner, UploadTask, available_decisions)
 from .config import Config, Mapping
@@ -146,6 +146,11 @@ class SyncEngine:
 
     def _local_row(self, m: Mapping, rel_path: str, h: FileHashes, st: os.stat_result) -> LocalRow:
         return LocalRow(m.id, norm_key(rel_path), rel_path, st.st_size, st.st_mtime_ns, h.md5, h.sha1, h.preid)
+
+    def _index_one(self, m: Mapping, rel_path: str, h: FileHashes, st: os.stat_result) -> LocalRow:
+        lf = self._local_row(m, rel_path, h, st)
+        self.db.put_local(lf)
+        return lf
 
     def _fresh_local(self, m: Mapping, rel_path: str) -> LocalRow | None:
         try:
@@ -311,11 +316,13 @@ class SyncEngine:
         self.db.replace_cloud_index(m.id, files, dirs)
         return len(files)
 
-    def refresh_cloud_dir(self, m: Mapping, rel_dir: str, recursive: bool = False) -> None:
-        """重新讀取某個 115 資料夾，避免用過期的索引做判斷。"""
+    def refresh_cloud_dir(self, m: Mapping, rel_dir: str, recursive: bool = False) -> bool:
+        """重新讀取某個 115 資料夾，避免用過期的索引做判斷。回傳是否成功讀到最新內容。"""
         cid = self.db.cloud_dir(m.id, rel_dir)
+        if cid is None and not rel_dir:
+            cid = self.resolve_root(m)
         if cid is None:
-            return
+            return False
         c = self.cloud_for(m)
         files, dirs = [], []
         try:
@@ -328,8 +335,136 @@ class SyncEngine:
                 files, dirs = self._cloud_rows(m, rel_dir, cid, c.list_dir(cid))
         except NotFoundError:
             self.db.forget_cloud_dir_prefix(m.id, rel_dir)
-            return
+            return False
         self.db.replace_cloud_listing(m.id, rel_dir, cid, files, dirs, recursive)
+        return True
+
+    # ------------------------------------------------------------ 115 端的變動（115 電腦版、App、網頁）
+    def apply_cloud_changes(self, account_id: str, changes: list[CloudChange]) -> int:
+        """115 端有變動：只重新讀取受影響的 115 資料夾並同步到 NAS（不必完整比對）。回傳處理的資料夾數。"""
+        if not changes:
+            return 0
+        c = self.client(account_id)
+        done = 0
+        for m in self.config.active_mappings():
+            if m.account_id != account_id or not m.can_download or not self.local_root_ok(m):
+                continue
+            by_cid = {cid: rel for rel, cid in self.db.cloud_dirs(m.id).values()}
+            if m.cloud_cid:
+                by_cid.setdefault(m.cloud_cid, "")
+            targets: set[str] = set()
+            unknown: list[str] = []
+            for ch in changes:
+                if ch.fid and ch.fid in by_cid:  # 資料夾本身改名、搬走或刪除：重新讀取它的上層
+                    targets.add(rel_parent(by_cid[ch.fid]) if by_cid[ch.fid] else "")
+                elif ch.parent_id and ch.parent_id in by_cid:
+                    targets.add(by_cid[ch.parent_id])
+                elif ch.fid and (row := self.db.cloud_file_by_fid(m.id, ch.fid)) is not None:
+                    targets.add(rel_parent(row.rel_path))
+                elif ch.fid:
+                    unknown.append(ch.fid)
+            for fid in unknown[:20]:  # 操作紀錄沒有上層資料夾：查一次檔案資訊
+                try:
+                    e = c.get_entry(fid)
+                except CloudError as err:
+                    log.debug("查詢 115 檔案 %s 失敗：%s", fid, err)
+                    continue
+                if e is not None and e.pid in by_cid:
+                    targets.add(by_cid[e.pid])
+            for rel_dir in sorted(targets):
+                self._sync_cloud_dir(m, rel_dir)
+                done += 1
+        return done
+
+    def _sync_cloud_dir(self, m: Mapping, rel_dir: str) -> None:
+        """重新讀取一個 115 資料夾（以及新搬入的子資料夾），並與 NAS 上同一位置比對、同步。"""
+        known = self.db.cloud_dirs(m.id)
+        dir_by_cid = {cid: rel for rel, cid in known.values()}
+        if not self.refresh_cloud_dir(m, rel_dir):
+            return  # 讀不到 115 上的最新內容就不比對，避免誤判成 115 上沒有檔案而重複上傳
+        subtrees = []
+        for key, (rel, cid) in list(self.db.cloud_dirs(m.id).items()):
+            if key in known or rel_parent(rel) != rel_dir:
+                continue
+            prev = dir_by_cid.get(cid)  # 同一個 115 資料夾換了位置：在 115 改名或搬移
+            if prev and norm_key(prev) != key and norm_key(prev) not in self.db.cloud_dirs(m.id):
+                self._mirror_cloud_move(m, prev, rel, is_dir=True)
+            self.refresh_cloud_dir(m, rel, recursive=True)  # 新出現的資料夾（搬入或複製）：讀取整個內容
+            subtrees.append(rel)
+        here = self.db.cloud_under(m.id, rel_dir) if rel_dir else self.db.cloud_files(m.id)
+        for row in here:  # 已同步的檔案在 115 改名或搬到這裡：NAS 也直接改名／搬移，不必重新下載
+            if rel_parent(row.rel_path) != rel_dir or self.db.get_state(m.id, row.rel_key):
+                continue
+            for st in self.db.states_by_cloud_fid(m.id, row.fid):
+                if st.rel_key != row.rel_key and st.cloud_sha1 == row.sha1 and not any(
+                        c.fid == row.fid for c in self.db.cloud_at(m.id, st.rel_key)):
+                    self._mirror_cloud_move(m, st.rel_path, row.rel_path, is_dir=False, state=st)
+                    break
+
+        # NAS 端：重新索引同一位置（可能有尚未處理的本機修改），只比對受影響的範圍
+        direct = lambda r: rel_parent(r.rel_path) == rel_dir  # noqa: E731
+        fresh = self._index_local_tree(m, rel_dir, recursive=False)
+        present = {r.rel_key for r in fresh}
+        for stale in self.db.local_under(m.id, rel_dir) if rel_dir else self.db.local_files(m.id):
+            if direct(stale) and stale.rel_key not in present and not os.path.exists(
+                    long_path(local_join(m.local_path, stale.rel_path))):
+                self.db.delete_local(m.id, stale.rel_key)
+        for sub in subtrees:
+            fresh += self._index_local_tree(m, sub, recursive=True)
+        scope = list(here) + (self.db.local_under(m.id, rel_dir) if rel_dir else self.db.local_files(m.id)) + \
+            self.db.states_under(m.id, rel_dir)
+        rows = [r for r in scope if direct(r) or any(r.rel_key == norm_key(t) or r.rel_key.startswith(norm_key(t) + "/")
+                                                    for t in subtrees)]
+        rows += [r for t in subtrees for r in self.db.cloud_under(m.id, t)]
+        planner = self.planner()
+        keys, groups = set(), set()
+        for r in rows:
+            g, status = planner.savedata_status(m, r.rel_path)
+            if g is not None and status == "approved":
+                groups.add(g)  # 已核可的遊戲存檔：照存檔規則（遊戲結束後）整組同步
+            else:
+                keys.add(r.rel_key)
+        if keys:
+            self.reconcile_keys(m, sorted(keys))
+        for g in sorted(groups):
+            self.sync_savedata_group(m, g)
+        log.info("115 端有變動，已同步：%s", cloud_join(m.cloud_path, rel_dir))
+        self.emit("cloud_changed", mapping_id=m.id, rel_dir=rel_dir)
+
+    def _mirror_cloud_move(self, m: Mapping, old_rel: str, new_rel: str, is_dir: bool, state=None) -> bool:
+        """115 上改名或搬移的檔案／資料夾，在 NAS 上做同樣的改名／搬移。NAS 端有改動或目的地已有東西時不動作。"""
+        planner = self.planner()
+        probe = (lambda r: r + "/x") if is_dir else (lambda r: r)
+        if (planner.ignore.match_rel(old_rel) or planner.ignore.match_rel(new_rel)
+                or planner.savedata_status(m, probe(old_rel))[0] is not None
+                or planner.savedata_status(m, probe(new_rel))[0] is not None):
+            return False
+        src = long_path(local_join(m.local_path, old_rel))
+        dst = long_path(local_join(m.local_path, new_rel))
+        same = os.path.normcase(src) == os.path.normcase(dst)
+        if not os.path.exists(src) or (os.path.exists(dst) and not same) or os.path.isdir(src) != is_dir:
+            return False
+        if not is_dir:
+            try:
+                st = os.stat(src)
+            except OSError:
+                return False
+            if state is None or st.st_size != state.local_size or st.st_mtime_ns != state.local_mtime_ns:
+                return False  # NAS 上的檔案已改過：交給一般比對（可能是衝突）
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if same:  # 只改大小寫：Windows 需經過暫存名稱
+                tmp = src + ".nas115sync-rename"
+                os.rename(src, tmp)
+                src = tmp
+            os.rename(src, dst)
+        except OSError as e:
+            log.warning("無法在 NAS 上同步 115 的改名／搬移 %s → %s：%s", old_rel, new_rel, e)
+            return False
+        self.db.rename_prefix(m.id, old_rel, new_rel)
+        self.db.add_history(m.id, "move_local", new_rel, True, detail=f"115 端改名／搬移，由 {old_rel}")
+        log.info("115 端改名／搬移，NAS 已同步：%s → %s", old_rel, new_rel)
+        return True
 
     def ensure_cloud_dir(self, m: Mapping, rel_dir: str) -> str:
         cid = self.db.cloud_dir(m.id, rel_dir)
@@ -849,7 +984,11 @@ class SyncEngine:
             return False
         if expected_sha1 and h.sha1 != expected_sha1.upper():
             log.info("NAS 檔案已被修改，不刪除：%s", rel_path)
-            self.reconcile_keys(m, [key])
+            try:  # 以最新內容重新判斷（索引可能還是修改前的）
+                st = os.stat(long_path(abs_path))
+            except OSError:
+                return False
+            self.reconcile_files(m, [self._index_one(m, rel_path, h, st)])
             return False
         if self.db.cloud_at(m.id, key):
             return False  # 115 上又出現了

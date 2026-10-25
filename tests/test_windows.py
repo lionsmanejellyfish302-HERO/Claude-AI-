@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from nas115sync.cloud.open115 import TokenStore
+from nas115sync.cloud.tokens import TokenStore
 from nas115sync.paths import long_path
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows 專用")

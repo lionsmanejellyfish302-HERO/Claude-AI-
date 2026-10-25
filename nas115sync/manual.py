@@ -245,6 +245,8 @@ def export_plans_csv(engine, plans: list[Plan], path: str) -> int:
 def send_to_recycle_bin(path: str) -> None:
     """Windows：移到資源回收筒（網路磁碟上的檔案 Windows 會直接刪除）；其他系統移到使用者暫存垃圾桶。"""
     path = os.path.abspath(path)
+    if not os.path.lexists(path):
+        raise FileNotFoundError(f"找不到：{path}")
     if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes

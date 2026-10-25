@@ -53,11 +53,12 @@ def running_process_names() -> set[str]:
     try:
         if sys.platform == "win32":
             out = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=15,
             ).stdout
             return {row[0].casefold() for row in csv.reader(io.StringIO(out)) if row}
-        out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=15).stdout
+        out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, errors="replace",
+                             timeout=15).stdout
         return {os.path.basename(line.strip()).casefold() for line in out.splitlines() if line.strip()}
     except (OSError, subprocess.SubprocessError):
         return set()

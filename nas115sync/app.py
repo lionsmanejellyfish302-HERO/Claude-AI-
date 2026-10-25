@@ -46,22 +46,30 @@ def setup_logging(verbose: bool = False) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def build_app(demo: bool = False) -> App:
+def make_client(config: Config, account_id: str, demo: bool = False) -> CloudClient:
+    """每個 115 帳號一個客戶端（登入資訊分開保存）。"""
     home = app_home()
-    config = Config(home / "demo_config.json") if demo else Config()
+    suffix = "" if account_id == "default" else f"_{account_id}"
     if demo:
         from .cloud.fake import FakeCloud
 
-        db = Database(home / "demo_state.db")
-        cloud: CloudClient = FakeCloud(home / "demo_cloud.json")
-    else:
-        from .cloud.open115 import Open115Client, TokenStore
+        return FakeCloud(home / f"demo_cloud{suffix}.json")
+    from .cloud.open115 import Open115Client, TokenStore
 
-        db = Database(home / "state.db")
-        s = config.settings
-        cloud = Open115Client(TokenStore(home / "tokens.dat"), client_id=s.client_id,
-                              min_interval=s.api_min_interval, part_size=max(5, s.part_size_mb) * 1024 * 1024)
-    return App(config, db, cloud, SyncEngine(config, db, cloud), demo)
+    s = config.settings
+    c = Open115Client(TokenStore(home / f"tokens{suffix}.dat"), client_id=s.client_id,
+                      min_interval=s.api_min_interval, part_size=max(5, s.part_size_mb) * 1024 * 1024)
+    c.set_proxy(s.proxy)
+    return c
+
+
+def build_app(demo: bool = False) -> App:
+    home = app_home()
+    config = Config(home / "demo_config.json") if demo else Config()
+    db = Database(home / ("demo_state.db" if demo else "state.db"))
+    clouds = {a.id: make_client(config, a.id, demo) for a in config.accounts}
+    engine = SyncEngine(config, db, clouds=clouds)
+    return App(config, db, clouds["default"], engine, demo)
 
 
 # 115 瀏覽器常見安裝位置（找不到時改用預設瀏覽器）

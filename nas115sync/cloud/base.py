@@ -8,6 +8,7 @@ from typing import Callable, Iterator
 
 from ..hashing import FileHashes
 from ..paths import cloud_parts, name_key, nfc, rel_join
+from ..transfers import TransferControl
 
 
 class CloudError(Exception):
@@ -46,7 +47,17 @@ class UploadResult:
     pick_code: str = ""
 
 
-ProgressFn = Callable[[int, int], None]
+class SessionStore:
+    """斷點續傳資訊的保存介面（引擎以資料庫實作；預設不保存）。"""
+
+    def get(self, key: str) -> dict | None:
+        return None
+
+    def put(self, key: str, data: dict) -> None:
+        pass
+
+    def delete(self, key: str) -> None:
+        pass
 
 
 class CloudClient(abc.ABC):
@@ -79,8 +90,16 @@ class CloudClient(abc.ABC):
 
     @abc.abstractmethod
     def upload(self, local_path: str, cid: str, name: str, hashes: FileHashes,
-               progress: ProgressFn | None = None, cancel: threading.Event | None = None) -> UploadResult:
-        """先嘗試秒傳，不成功再實際上傳。"""
+               control: TransferControl | None = None, sessions: SessionStore | None = None) -> UploadResult:
+        """先嘗試秒傳，不成功再實際上傳（大檔可斷點續傳）。"""
+
+    @abc.abstractmethod
+    def download(self, fid: str, pick_code: str, dest_path: str, control: TransferControl | None = None) -> None:
+        """下載到 dest_path；dest_path 已有部分內容時從其大小處續傳。"""
+
+    def search(self, keyword: str, cid: str = "0", limit: int = 500) -> list[CloudEntry]:
+        """以檔名搜尋（cid 底下）。"""
+        raise CloudError("此雲端不支援搜尋")
 
     def user_label(self) -> str:
         return ""

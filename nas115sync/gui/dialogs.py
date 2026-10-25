@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from ..app import open_in_115_browser
+from ..config import DELETE_LABELS, DIRECTION_LABELS
 from ..mapping_check import inspect_mapping, suggest_mappings
 from ..paths import cloud_norm
 from .util import open_local, scrolled_text, set_text, tree_with_scroll
@@ -36,27 +37,68 @@ class _Dialog(tk.Toplevel):
 
 
 class AddMappingDialog(_Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, "新增路徑對應")
+    """新增或編輯路徑對應：路徑、同步方向、刪除處理、帳號、篩選。"""
+
+    def __init__(self, parent, accounts, mapping=None):
+        super().__init__(parent, "編輯路徑對應" if mapping else "新增路徑對應")
+        self.accounts = accounts
+        m = mapping
         b = self.body
         ttk.Label(b, text="NAS 資料夾（例如 \\\\NAS\\home\\Photos 或 Z:\\Photos）：").grid(row=0, column=0, sticky="w")
-        self.local = tk.StringVar()
+        self.local = tk.StringVar(value=m.local_path if m else "")
         ttk.Entry(b, textvariable=self.local, width=60).grid(row=1, column=0, sticky="we")
         ttk.Button(b, text="瀏覽…", command=self._browse).grid(row=1, column=1, padx=4)
-        ttk.Label(b, text="115 資料夾路徑（例如 /NAS備份/Photos）：").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        self.cloud = tk.StringVar()
+        ttk.Label(b, text="115 資料夾路徑（例如 /NAS備份/Photos）：").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.cloud = tk.StringVar(value=m.cloud_path if m else "")
         ttk.Entry(b, textvariable=self.cloud, width=60).grid(row=3, column=0, sticky="we")
-        self.savedata = tk.BooleanVar()
-        ttk.Checkbutton(b, text="整個資料夾都是遊戲存檔（每個子資料夾為一個遊戲）", variable=self.savedata).grid(
-            row=4, column=0, sticky="w", pady=8)
-        ttk.Label(b, text="新增後狀態為「待核對」，需按「核對確認」由本人確認後才會同步。",
-                  foreground="#a05000").grid(row=5, column=0, columnspan=2, sticky="w")
+
+        opts = ttk.LabelFrame(b, text="同步方式", padding=8)
+        opts.grid(row=4, column=0, columnspan=2, sticky="we", pady=8)
+        ttk.Label(opts, text="方向：").grid(row=0, column=0, sticky="w")
+        self.direction = ttk.Combobox(opts, state="readonly", width=26, values=list(DIRECTION_LABELS.values()))
+        self.direction.set(DIRECTION_LABELS[m.direction if m else "upload"])
+        self.direction.grid(row=0, column=1, sticky="w")
+        ttk.Label(opts, text="刪除處理：").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self.delete_mode = ttk.Combobox(opts, state="readonly", width=22, values=list(DELETE_LABELS.values()))
+        self.delete_mode.set(DELETE_LABELS[m.delete_mode if m else ""])
+        self.delete_mode.grid(row=0, column=3, sticky="w")
+        ttk.Label(opts, text="115 帳號：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.account = ttk.Combobox(opts, state="readonly", width=26, values=[a.label for a in accounts])
+        cur = next((a.label for a in accounts if m and a.id == m.account_id), accounts[0].label)
+        self.account.set(cur)
+        self.account.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        self.savedata = tk.BooleanVar(value=bool(m and m.savedata))
+        ttk.Checkbutton(opts, text="整個資料夾都是遊戲存檔（每個子資料夾為一個遊戲）", variable=self.savedata).grid(
+            row=1, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(6, 0))
+
+        flt = ttk.LabelFrame(b, text="篩選（選填）", padding=8)
+        flt.grid(row=5, column=0, columnspan=2, sticky="we")
+        ttk.Label(flt, text="只同步（例如 *.jpg *.mp4）：").grid(row=0, column=0, sticky="w")
+        self.include = tk.StringVar(value=" ".join(m.include_patterns) if m else "")
+        ttk.Entry(flt, textvariable=self.include, width=40).grid(row=0, column=1, sticky="we")
+        ttk.Label(flt, text="排除（例如 *.iso cache Temp/*）：").grid(row=1, column=0, sticky="w")
+        self.exclude = tk.StringVar(value=" ".join(m.exclude_patterns) if m else "")
+        ttk.Entry(flt, textvariable=self.exclude, width=40).grid(row=1, column=1, sticky="we")
+        ttk.Label(flt, text="檔案大小 MB（最小／最大，0 = 不限）：").grid(row=2, column=0, sticky="w")
+        sz = ttk.Frame(flt)
+        sz.grid(row=2, column=1, sticky="w")
+        self.min_mb = tk.StringVar(value=str((m.min_size if m else 0) / 1048576).rstrip("0").rstrip(".") or "0")
+        self.max_mb = tk.StringVar(value=str((m.max_size if m else 0) / 1048576).rstrip("0").rstrip(".") or "0")
+        ttk.Entry(sz, textvariable=self.min_mb, width=10).pack(side="left")
+        ttk.Label(sz, text=" ～ ").pack(side="left")
+        ttk.Entry(sz, textvariable=self.max_mb, width=10).pack(side="left")
+        self.skip_hidden = tk.BooleanVar(value=bool(m and m.skip_hidden))
+        ttk.Checkbutton(flt, text="略過隱藏檔／系統檔", variable=self.skip_hidden).grid(row=3, column=0, sticky="w")
+        flt.columnconfigure(1, weight=1)
+
+        ttk.Label(b, text="新增或變更路徑後狀態為「待核對」，需按「核對確認」由本人確認後才會同步。",
+                  foreground="#a05000").grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
         bar = ttk.Frame(b)
-        bar.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(bar, text="新增", command=self._ok).pack(side="left", padx=4)
+        bar.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(bar, text="確定", command=self._ok).pack(side="left", padx=4)
         ttk.Button(bar, text="取消", command=self.destroy).pack(side="left")
         b.columnconfigure(0, weight=1)
-        self.center(640, 260)
+        self.center(780, 560)
 
     def _browse(self):
         d = filedialog.askdirectory(parent=self, title="選擇 NAS 資料夾")
@@ -67,7 +109,23 @@ class AddMappingDialog(_Dialog):
         if not self.local.get().strip() or not self.cloud.get().strip():
             messagebox.showwarning("缺少資料", "請填寫 NAS 資料夾與 115 路徑", parent=self)
             return
-        self.result = (self.local.get().strip(), cloud_norm(self.cloud.get().strip()), self.savedata.get())
+        try:
+            min_size = int(float(self.min_mb.get() or 0) * 1048576)
+            max_size = int(float(self.max_mb.get() or 0) * 1048576)
+        except ValueError:
+            messagebox.showwarning("格式錯誤", "檔案大小請填數字（MB）", parent=self)
+            return
+        inv_dir = {v: k for k, v in DIRECTION_LABELS.items()}
+        inv_del = {v: k for k, v in DELETE_LABELS.items()}
+        labels = [a.label for a in self.accounts]
+        self.result = {
+            "local_path": self.local.get().strip(), "cloud_path": cloud_norm(self.cloud.get().strip()),
+            "savedata": self.savedata.get(), "direction": inv_dir[self.direction.get()],
+            "delete_mode": inv_del[self.delete_mode.get()],
+            "account_id": self.accounts[labels.index(self.account.get())].id,
+            "include_patterns": self.include.get().split(), "exclude_patterns": self.exclude.get().split(),
+            "min_size": min_size, "max_size": max_size, "skip_hidden": self.skip_hidden.get(),
+        }
         self.destroy()
 
 

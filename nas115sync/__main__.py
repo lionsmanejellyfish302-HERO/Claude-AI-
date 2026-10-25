@@ -20,6 +20,7 @@ import time
 
 from .app import build_app, setup_logging
 from .compare import KIND_LABELS, available_decisions
+from .config import DIRECTION_LABELS
 
 log = logging.getLogger("nas115sync")
 
@@ -48,7 +49,7 @@ def _ask(prompt: str) -> bool:
 
 
 def cmd_login(app, args) -> int:
-    cloud = app.cloud
+    cloud = app.engine.client(args.account)
     if app.demo:
         print("示範模式不需要登入")
         return 0
@@ -87,7 +88,109 @@ def cmd_login(app, args) -> int:
 
 
 def cmd_whoami(app, args) -> int:
-    print(app.cloud.user_label() or "（未登入）")
+    for a in app.config.accounts:
+        try:
+            label = app.engine.client(a.id).user_label() or "（未登入）"
+        except Exception as e:  # noqa: BLE001
+            label = f"（未登入：{e}）"
+        print(f"{a.id}  {a.label}：{label}")
+    return 0
+
+
+def cmd_accounts(app, args) -> int:
+    from .app import make_client
+
+    cfg = app.config
+    if args.action == "add":
+        a = cfg.add_account(args.label)
+        app.engine.clouds[a.id] = make_client(cfg, a.id, app.demo)
+        print(f"已新增帳號 {a.id}（{a.label}），請執行：login --account {a.id}")
+    elif args.action == "remove":
+        cfg.remove_account(args.id)
+        print("已刪除帳號")
+    else:
+        for a in cfg.accounts:
+            used = sum(m.account_id == a.id for m in cfg.mappings)
+            print(f"{a.id}  {a.label}（{used} 個對應）")
+    return 0
+
+
+def _resolve_cloud(app, account: str, path: str) -> str:
+    cid = app.engine.client(account).resolve_path(path)
+    if cid is None:
+        raise SystemExit(f"115 上找不到：{path}")
+    return cid
+
+
+def cmd_ls(app, args) -> int:
+    c = app.engine.client(args.account)
+    for e in c.list_dir(_resolve_cloud(app, args.account, args.path)):
+        kind = "📁" if e.is_dir else "  "
+        print(f"{kind} {e.name:<50} {'' if e.is_dir else _human(e.size):>10}  {e.sha1}")
+    return 0
+
+
+def cmd_search(app, args) -> int:
+    c = app.engine.client(args.account)
+    for e in c.search(args.keyword, _resolve_cloud(app, args.account, args.within)):
+        print(f"{'📁' if e.is_dir else '  '} {e.name}  （資料夾 ID {e.pid}）  {'' if e.is_dir else _human(e.size)}")
+    return 0
+
+
+def cmd_upload(app, args) -> int:
+    from . import manual
+
+    cid = app.engine.client(args.account).ensure_path(args.cloud)
+    stats = manual.upload_paths(app.engine, args.account, args.local, cid, args.conflict)
+    print(f"秒傳 {stats['instant']}、實際上傳 {stats['uploaded']}、略過 {stats['skipped']}、失敗 {stats['failed']}")
+    return 0 if not stats["failed"] else 1
+
+
+def cmd_download(app, args) -> int:
+    from . import manual
+    from .paths import cloud_parts
+
+    c = app.engine.client(args.account)
+    parts = cloud_parts(args.cloud)
+    parent = _resolve_cloud(app, args.account, "/" + "/".join(parts[:-1]))
+    entry = c.find_child(parent, parts[-1]) if parts else None
+    if entry is None:
+        raise SystemExit(f"115 上找不到：{args.cloud}")
+    stats = manual.download_entries(app.engine, args.account, [entry], args.local, args.conflict)
+    print(f"下載 {stats['downloaded']}（其中從 NAS 複製 {stats['copied']}）、略過 {stats['skipped']}、"
+          f"失敗 {stats['failed']}")
+    return 0 if not stats["failed"] else 1
+
+
+def cmd_dupes(app, args) -> int:
+    from . import manual
+
+    if args.scan:
+        app.engine.analyze(progress=_progress)
+        print()
+    groups = manual.duplicate_report(app.engine)
+    for g in groups[: args.limit]:
+        print(f"\nSHA-1 {g['sha1']}  {_human(g['size'])}  NAS {g['nas_count']} 份、115 {g['cloud_count']} 份、"
+              f"多佔 {_human(g['wasted'])}")
+        for i in g["items"]:
+            print(f"   [{i['where']}] {i['path']}")
+    print(f"\n共 {len(groups)} 組重複檔案，可省下 {_human(sum(g['wasted'] for g in groups))}")
+    return 0
+
+
+def cmd_schedule(app, args) -> int:
+    from .scheduler import describe, new_schedule
+
+    s = app.config.settings
+    if args.action == "add":
+        days = [int(d) for d in args.days.split(",")] if args.days else None
+        s.schedules.append(new_schedule(args.time, days, args.action_type))
+        app.config.save()
+    elif args.action == "remove":
+        s.schedules = [x for x in s.schedules if x["id"] != args.id]
+        app.config.save()
+    for x in s.schedules:
+        print(f"{x['id']}  {describe(x)}")
     return 0
 
 
@@ -99,18 +202,21 @@ def cmd_mapping(app, args) -> int:
         for m in cfg.mappings:
             flag = "✔ 已核對" if m.confirmed else "✘ 待核對"
             extra = "（遊戲存檔）" if m.savedata else ""
-            print(f"{m.id}  {flag}  {m.local_path}  ⇄  {m.cloud_path}{extra}")
+            print(f"{m.id}  {flag}  {m.local_path}  ⇄  {m.cloud_path}{extra}  [{DIRECTION_LABELS[m.direction]}]")
         return 0
     if args.action == "add":
-        m = cfg.add_mapping(args.local, args.cloud, savedata=args.savedata)
+        m = cfg.add_mapping(args.local, args.cloud, savedata=args.savedata, direction=args.direction,
+                            delete_mode=args.delete_mode, account_id=args.account,
+                            include_patterns=args.include or [], exclude_patterns=args.exclude or [],
+                            min_size=args.min_size, max_size=args.max_size, skip_hidden=args.skip_hidden)
         print(f"已新增對應 {m.id}（尚未核對，請執行：mapping confirm {m.id}）")
         return 0
     if args.action == "suggest":
-        for s in suggest_mappings(args.local, args.cloud, app.cloud):
+        for s in suggest_mappings(args.local, args.cloud, app.engine.client(args.account)):
             mark = "115 已有同名資料夾" if s.cloud_exists else "115 將新建"
             print(f"{s.local_path}  ⇄  {s.cloud_path}   [{mark}]")
             if args.add:
-                cfg.add_mapping(s.local_path, s.cloud_path)
+                cfg.add_mapping(s.local_path, s.cloud_path, account_id=args.account)
         if args.add:
             print("已加入為「待核對」對應，請逐一執行 mapping confirm 核對")
         return 0
@@ -127,7 +233,7 @@ def cmd_mapping(app, args) -> int:
         print("已取消核對，此對應不會再同步")
         return 0
     # confirm
-    info = inspect_mapping(m, app.cloud, cfg.mappings)
+    info = inspect_mapping(m, app.engine.cloud_for(m), cfg.mappings)
     print("\n".join(info.lines(m)))
     if not info.local_ok:
         print("NAS 路徑無法存取，不能確認")
@@ -139,7 +245,7 @@ def cmd_mapping(app, args) -> int:
     if cid is None:
         if not args.yes and not _ask(f"115 上沒有 {m.cloud_path}，要建立嗎？(yes/no) "):
             return 1
-        cid = app.cloud.ensure_path(m.cloud_path)
+        cid = app.engine.cloud_for(m).ensure_path(m.cloud_path)
     cfg.confirm_mapping(m.id, cid)
     print("已核對確認")
     return 0
@@ -152,15 +258,21 @@ def _print_plans(app, plans) -> None:
         print(f"\n[{m.local_path} ⇄ {m.cloud_path}]")
         for w in p.warnings:
             print(f"  ⚠ {w}")
-        print(f"  待上傳 {s['uploads']} 個（{_human(s['upload_bytes'])}）、已相同 {s['identical']}、"
-              f"待核對 {s['reviews']}、僅 115 有 {s['cloud_only']}、自動刪除 {s['deletes']}、"
-              f"新建資料夾 {s['mkdirs']}、暫時無法讀取 {s['unreadable']}")
+        print(f"  [{DIRECTION_LABELS[m.direction]}] 待上傳 {s['uploads']} 個（{_human(s['upload_bytes'])}）、"
+              f"待下載 {s['downloads']} 個（{_human(s['download_bytes'])}）、已相同 {s['identical']}、"
+              f"待核對 {s['reviews']}、僅 115 有 {s['cloud_only']}、僅 NAS 有 {s['local_only']}、"
+              f"刪除 115 {s['deletes']}／NAS {s['local_deletes']}、新建資料夾 {s['mkdirs']}、"
+              f"暫時無法讀取 {s['unreadable']}")
 
 
 def cmd_scan(app, args) -> int:
     plans = app.engine.analyze(progress=_progress)
     print()
     _print_plans(app, plans)
+    if args.csv:
+        from .manual import export_plans_csv
+
+        print(f"已匯出 {export_plans_csv(app.engine, plans, args.csv)} 筆到 {args.csv}")
     print(f"\n待核對總數：{app.db.count_pending()}（執行 reviews 查看）")
     return 0
 
@@ -169,12 +281,13 @@ def cmd_sync(app, args) -> int:
     plans = app.engine.analyze(progress=_progress)
     print()
     _print_plans(app, plans)
-    total = sum(len(p.uploads) + len(p.deletes) for p in plans)
+    total = sum(len(p.uploads) + len(p.downloads) + len(p.deletes) + len(p.local_deletes) for p in plans)
     if total and not args.yes and not _ask(f"\n執行以上 {total} 項自動同步？(yes/no) "):
         return 1
     stats = app.engine.execute(plans, progress=_progress)
-    print(f"\n完成：上傳 {stats['uploaded']}（秒傳 {stats['instant']}）、失敗 {stats['failed']}、"
-          f"刪除 {stats['deleted']}、連結 {stats['linked']}")
+    print(f"\n完成：上傳 {stats['uploaded']}（秒傳 {stats['instant']}）、下載 {stats['downloaded']}"
+          f"（從 NAS 複製 {stats['copied']}）、失敗 {stats['failed']}、刪除 115 {stats['deleted']}／"
+          f"NAS {stats['local_deleted']}、連結 {stats['linked']}")
     print(f"待核對總數：{app.db.count_pending()}")
     return 0
 
@@ -206,9 +319,12 @@ def cmd_decide(app, args) -> int:
 def cmd_watch(app, args) -> int:
     from .watcher import RealtimeSync
 
+    from .scheduler import Scheduler
+
     rt = RealtimeSync(app.engine)
     rt.start()
-    print("即時同步中，按 Ctrl+C 結束…")
+    Scheduler(app.engine).start()
+    print("即時同步中（排程也會執行），按 Ctrl+C 結束…")
     try:
         while True:
             time.sleep(1)
@@ -237,7 +353,15 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("login", help="登入 115 開放平台")
     p.add_argument("--client-id", help="115 開放平台 AppID")
     p.add_argument("--refresh-token", help="直接使用已取得的 refresh_token")
-    sub.add_parser("whoami", help="顯示目前登入的 115 帳號")
+    p.add_argument("--account", default="default", help="帳號 ID（多帳號時）")
+    sub.add_parser("whoami", help="顯示所有 115 帳號的登入狀態")
+    p = sub.add_parser("accounts", help="管理多個 115 帳號")
+    asub = p.add_subparsers(dest="action")
+    asub.add_parser("list")
+    q = asub.add_parser("add")
+    q.add_argument("label")
+    q = asub.add_parser("remove")
+    q.add_argument("id")
 
     p = sub.add_parser("mapping", help="管理 NAS ⇄ 115 路徑對應")
     msub = p.add_subparsers(dest="action", required=True)
@@ -246,17 +370,28 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("local")
     q.add_argument("cloud")
     q.add_argument("--savedata", action="store_true", help="整個資料夾都是遊戲存檔")
+    q.add_argument("--direction", choices=["upload", "download", "two_way"], default="upload",
+                   help="upload=NAS→115（預設） download=115→NAS two_way=雙向")
+    q.add_argument("--delete-mode", choices=["", "review", "auto", "ignore"], default="")
+    q.add_argument("--account", default="default")
+    q.add_argument("--include", nargs="*", help="只同步符合的檔名，例如 *.jpg *.png")
+    q.add_argument("--exclude", nargs="*", help="不同步符合的檔名/資料夾，例如 *.iso cache")
+    q.add_argument("--min-size", type=int, default=0, help="最小檔案大小（bytes）")
+    q.add_argument("--max-size", type=int, default=0, help="最大檔案大小（bytes）")
+    q.add_argument("--skip-hidden", action="store_true", help="略過隱藏/系統檔")
     q = msub.add_parser("suggest", help="依名稱自動建議 NAS 根目錄下所有資料夾的對應")
     q.add_argument("local", help="NAS 根目錄，例如 \\\\NAS\\home 或 Z:\\")
     q.add_argument("cloud", help="115 根目錄，例如 /NAS備份")
     q.add_argument("--add", action="store_true", help="把建議加入為待核對對應")
+    q.add_argument("--account", default="default")
     for name in ("confirm", "unconfirm", "remove"):
         q = msub.add_parser(name)
         q.add_argument("id")
         if name == "confirm":
             q.add_argument("--yes", action="store_true", help="不詢問直接確認（自動化用）")
 
-    sub.add_parser("scan", help="比對但不上傳")
+    p = sub.add_parser("scan", help="比對但不上傳")
+    p.add_argument("--csv", help="把比對結果匯出成 CSV 檔")
     p = sub.add_parser("sync", help="比對並執行自動同步")
     p.add_argument("--yes", action="store_true")
     p = sub.add_parser("reviews", help="列出待核對項目")
@@ -265,14 +400,47 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("id", type=int)
     p.add_argument("decision")
     p.add_argument("--process", nargs="*", help="（存檔群組核可時）遊戲執行檔名稱，例如 eldenring.exe")
-    sub.add_parser("watch", help="即時同步")
+    sub.add_parser("watch", help="即時同步（含排程）")
+    p = sub.add_parser("ls", help="列出 115 資料夾內容")
+    p.add_argument("path", nargs="?", default="/")
+    p.add_argument("--account", default="default")
+    p = sub.add_parser("search", help="搜尋 115 檔名")
+    p.add_argument("keyword")
+    p.add_argument("--within", default="/", help="只搜尋此 115 資料夾底下")
+    p.add_argument("--account", default="default")
+    for name, helptext in (("upload", "手動上傳 NAS 檔案/資料夾到 115（秒傳優先）"),
+                           ("download", "手動下載 115 檔案/資料夾到 NAS（可續傳、驗證 SHA-1）")):
+        p = sub.add_parser(name, help=helptext)
+        if name == "upload":
+            p.add_argument("local", nargs="+")
+            p.add_argument("cloud", help="115 目的資料夾（不存在會建立）")
+        else:
+            p.add_argument("cloud", help="115 檔案或資料夾路徑")
+            p.add_argument("local", help="NAS 目的資料夾")
+        p.add_argument("--conflict", choices=["keep_both", "overwrite", "skip"], default="keep_both",
+                       help="同名但內容不同時：保留兩者（預設）/覆蓋/略過")
+        p.add_argument("--account", default="default")
+    p = sub.add_parser("dupes", help="列出 NAS 與 115 上的重複檔案（依 SHA-1）")
+    p.add_argument("--scan", action="store_true", help="先做完整比對以更新索引")
+    p.add_argument("--limit", type=int, default=50)
+    p = sub.add_parser("schedule", help="管理排程")
+    ssub = p.add_subparsers(dest="action")
+    ssub.add_parser("list")
+    q = ssub.add_parser("add")
+    q.add_argument("time", help="HH:MM，例如 03:00")
+    q.add_argument("--days", help="星期（0=一 … 6=日，逗號分隔），預設每天")
+    q.add_argument("--action-type", choices=["sync", "scan"], default="sync")
+    q = ssub.add_parser("remove")
+    q.add_argument("id")
     sub.add_parser("gui", help="開啟圖形介面")
 
     args = ap.parse_args(argv)
     setup_logging(args.verbose)
     app = build_app(demo=args.demo)
-    handlers = {"login": cmd_login, "whoami": cmd_whoami, "mapping": cmd_mapping, "scan": cmd_scan,
-                "sync": cmd_sync, "reviews": cmd_reviews, "decide": cmd_decide, "watch": cmd_watch,
+    handlers = {"login": cmd_login, "whoami": cmd_whoami, "accounts": cmd_accounts, "mapping": cmd_mapping,
+                "scan": cmd_scan, "sync": cmd_sync, "reviews": cmd_reviews, "decide": cmd_decide,
+                "watch": cmd_watch, "ls": cmd_ls, "search": cmd_search, "upload": cmd_upload,
+                "download": cmd_download, "dupes": cmd_dupes, "schedule": cmd_schedule,
                 "gui": cmd_gui, None: cmd_gui}
     try:
         return handlers[args.cmd](app, args)

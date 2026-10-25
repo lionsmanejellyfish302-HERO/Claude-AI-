@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS ignores(
 CREATE TABLE IF NOT EXISTS savedata_groups(
     mapping_id TEXT, rel_key TEXT, rel_dir TEXT, status TEXT, process_names TEXT,
     last_upload REAL, PRIMARY KEY(mapping_id, rel_key));
+CREATE TABLE IF NOT EXISTS upload_sessions(key TEXT PRIMARY KEY, data TEXT, updated REAL);
 CREATE TABLE IF NOT EXISTS history(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, mapping_id TEXT, action TEXT,
     rel_path TEXT, ok INTEGER, instant INTEGER, size INTEGER, detail TEXT);
@@ -304,6 +305,10 @@ class Database:
                          (mapping_id, rel_key))
         return [self._cloud_row(r) for r in rows]
 
+    def cloud_under(self, mapping_id: str, rel_dir: str) -> list[CloudRow]:
+        sql, args = _under("SELECT * FROM cloud_files WHERE mapping_id=?", mapping_id, rel_dir)
+        return [self._cloud_row(r) for r in self._all(sql, args)]
+
     def cloud_files(self, mapping_id: str) -> list[CloudRow]:
         return [self._cloud_row(r) for r in
                 self._all("SELECT * FROM cloud_files WHERE mapping_id=? ORDER BY rel_key", (mapping_id,))]
@@ -491,6 +496,41 @@ class Database:
         d["process_names"] = json.loads(d["process_names"] or "[]")
         return SavedataGroup(**d)
 
+    # ---------------------------------------------------------------- 斷點續傳
+    def session_get(self, key: str) -> dict | None:
+        r = self._one("SELECT data FROM upload_sessions WHERE key=?", (key,))
+        return json.loads(r["data"]) if r else None
+
+    def session_put(self, key: str, data: dict) -> None:
+        self._exec("INSERT OR REPLACE INTO upload_sessions VALUES(?,?,?)", (key, json.dumps(data), time.time()))
+
+    def session_delete(self, key: str) -> None:
+        self._exec("DELETE FROM upload_sessions WHERE key=?", (key,))
+
+    def purge_sessions(self, older_than_days: float = 7) -> None:
+        self._exec("DELETE FROM upload_sessions WHERE updated < ?", (time.time() - older_than_days * 86400,))
+
+    # ---------------------------------------------------------------- 重複檔案
+    def duplicate_groups(self, min_count: int = 2) -> list[dict]:
+        """NAS 與 115（所有對應）中 SHA-1 相同的檔案群組。"""
+        groups: dict[str, dict] = {}
+        for r in self._all("SELECT mapping_id, rel_path, size, sha1 FROM local_files WHERE sha1 != ''"):
+            g = groups.setdefault(r["sha1"], {"sha1": r["sha1"], "size": r["size"], "items": []})
+            g["items"].append({"where": "NAS", "mapping_id": r["mapping_id"], "rel_path": r["rel_path"]})
+        for r in self._all("SELECT mapping_id, fid, pid, rel_path, size, sha1 FROM cloud_files WHERE sha1 != ''"):
+            g = groups.setdefault(r["sha1"], {"sha1": r["sha1"], "size": r["size"], "items": []})
+            g["items"].append({"where": "115", "mapping_id": r["mapping_id"], "rel_path": r["rel_path"],
+                               "fid": r["fid"], "pid": r["pid"]})
+        out = []
+        for g in groups.values():
+            nas = sum(i["where"] == "NAS" for i in g["items"])
+            cloud = len(g["items"]) - nas
+            if nas >= min_count or cloud >= min_count:
+                g["nas_count"], g["cloud_count"] = nas, cloud
+                g["wasted"] = g["size"] * (max(0, nas - 1) + max(0, cloud - 1))
+                out.append(g)
+        return sorted(out, key=lambda g: g["wasted"], reverse=True)
+
     # ---------------------------------------------------------------- 紀錄
     def add_history(self, mapping_id: str, action: str, rel_path: str, ok: bool,
                     instant: bool = False, size: int = 0, detail: str = "") -> None:
@@ -509,7 +549,11 @@ class Database:
             " SUM(CASE WHEN instant=0 THEN size ELSE 0 END) AS real_bytes"
             " FROM history WHERE ok=1 AND action LIKE 'upload%'"
         )
-        return {k: (r[k] or 0) for k in ("instant_n", "instant_bytes", "real_n", "real_bytes")} if r else {}
+        out = {k: (r[k] or 0) for k in ("instant_n", "instant_bytes", "real_n", "real_bytes")} if r else {}
+        d = self._one("SELECT COUNT(*) AS down_n, SUM(CASE WHEN instant=1 THEN 1 ELSE 0 END) AS copy_n"
+                      " FROM history WHERE ok=1 AND action LIKE 'download%'")
+        out.update({"down_n": (d["down_n"] or 0) if d else 0, "copy_n": (d["copy_n"] or 0) if d else 0})
+        return out
 
 
 def _is_under(key: str, dir_key: str) -> bool:

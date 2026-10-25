@@ -62,6 +62,7 @@ class RealtimeSync:
         self._next_rescan = 0.0
         self._watches: dict[str, object] = {}
         self._next_watch_check = 0.0
+        self._next_cloud_poll = 0.0
         self.running = False
 
     # ------------------------------------------------------------ 啟動／停止
@@ -223,7 +224,11 @@ class RealtimeSync:
                 self._dirty_groups.pop((mid, group), None)
             self._submit(self._save_pool, (mid, "group:" + group), self.engine.sync_savedata_group, m, group)
 
-        if now >= self._next_rescan and not self._rescan_running.is_set():
+        if now >= self._next_cloud_poll:
+            self._next_cloud_poll = now + max(30, s.savedata_cloud_poll_seconds)
+            self._poll_cloud_savedata()
+
+        if now >= self._next_rescan and not self._rescan_running.is_set() and not self.engine.full_lock.locked():
             self._next_rescan = now + max(1, s.rescan_interval_minutes) * 60
             self._rescan_running.set()
             threading.Thread(target=self._rescan, name="rescan", daemon=True).start()
@@ -303,6 +308,17 @@ class RealtimeSync:
         except RuntimeError:  # 停止中
             with self._lock:
                 self._inflight.discard(key)
+
+    def _poll_cloud_savedata(self) -> None:
+        """雙向／下載模式：定期檢查 115 上已核可的存檔資料夾，有別台電腦上傳的新存檔就下載（遊戲結束後）。"""
+        for m in self.config.active_mappings():
+            if not m.can_download or not self.engine.local_root_ok(m):
+                continue
+            for g in self.engine.db.list_groups(m.id):
+                key = (m.id, "group:" + g.rel_dir)
+                if g.status != "approved" or key in self._inflight or (m.id, g.rel_dir) in self._dirty_groups:
+                    continue
+                self._submit(self._save_pool, key, self.engine.sync_savedata_group, m, g.rel_dir)
 
     def _rescan(self) -> None:
         try:

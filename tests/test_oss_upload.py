@@ -2,8 +2,10 @@ import base64
 import json
 
 import oss2
+import pytest
 
 from nas115sync.cloud import oss_upload
+from nas115sync.transfers import Cancelled, TransferManager
 
 
 class FakeResult:
@@ -26,6 +28,8 @@ class FakeBucket:
         FakeBucket.instances.append(self)
 
     def put_object(self, key, data, headers=None, progress_callback=None):
+        if progress_callback:
+            progress_callback(len(data), len(data))
         self.put = (key, data, headers)
         return FakeResult(json.dumps({"state": True, "data": {"file_id": "F1"}}).encode())
 
@@ -34,7 +38,9 @@ class FakeBucket:
             upload_id = "UP1"
         return R()
 
-    def upload_part(self, key, upload_id, n, data):
+    def upload_part(self, key, upload_id, n, data, progress_callback=None):
+        if progress_callback:
+            progress_callback(len(data), len(data))
         self.parts.append((n, len(data)))
         return FakeResult(etag=f"E{n}")
 
@@ -69,12 +75,45 @@ def test_multipart_upload(tmp_path, monkeypatch):
     monkeypatch.setattr(oss2, "Bucket", FakeBucket)
     f = tmp_path / "big.bin"
     f.write_bytes(b"y" * 2500)
-    seen = []
-    body = oss_upload.upload_to_oss(str(f), 2500, token, "fhnfile", "obj", "{}", "", 1000,
-                                    progress=lambda d, t: seen.append(d))
+    mgr = TransferManager()
+    ctrl = mgr.start("upload", "m", "big.bin", 2500)
+    ids = []
+    body = oss_upload.upload_to_oss(str(f), 2500, token, "fhnfile", "obj", "{}", "", 1000, ctrl,
+                                    on_upload_id=ids.append)
     b = FakeBucket.instances[-1]
     assert b.parts == [(1, 1000), (2, 1000), (3, 500)]
     nums, headers = b.completed
     assert nums == [1, 2, 3] and "x-oss-callback" in headers and "x-oss-callback-var" not in headers
-    assert seen == [1000, 2000, 2500]
+    assert ctrl.t.done == 2500 and ids == ["UP1"]
     assert body["data"]["file_id"] == "F2"
+
+
+def test_multipart_resume_skips_finished_parts(tmp_path, monkeypatch):
+    class ResumeBucket(FakeBucket):
+        def list_parts(self, key, upload_id, marker="", max_parts=1000, headers=None):
+            assert upload_id == "OLD"
+
+            class R:
+                parts = [oss2.models.PartInfo(1, "E1", size=1000), oss2.models.PartInfo(2, "E2", size=1000)]
+                is_truncated = False
+                next_marker = ""
+            return R()
+
+    monkeypatch.setattr(oss2, "Bucket", ResumeBucket)
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"z" * 2500)
+    oss_upload.upload_to_oss(str(f), 2500, token, "fhnfile", "obj", "{}", "", 1000, upload_id="OLD")
+    b = FakeBucket.instances[-1]
+    assert b.parts == [(3, 500)]  # 只補傳缺少的分片
+    assert b.completed[0] == [1, 2, 3]
+
+
+def test_cancel_stops_upload(tmp_path, monkeypatch):
+    monkeypatch.setattr(oss2, "Bucket", FakeBucket)
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"y" * 2500)
+    mgr = TransferManager()
+    ctrl = mgr.start("upload", "m", "big.bin", 2500)
+    mgr.cancel(ctrl.t.id)
+    with pytest.raises(Cancelled):
+        oss_upload.upload_to_oss(str(f), 2500, token, "fhnfile", "obj", "{}", "", 1000, ctrl)

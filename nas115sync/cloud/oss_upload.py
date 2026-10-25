@@ -1,24 +1,24 @@
 """115 非秒傳檔案的實際上傳：依 upload/init 回傳的 bucket/object 與 STS 憑證上傳到阿里雲 OSS，
-並帶上 115 的 callback，讓 115 在上傳完成後建立檔案。"""
+並帶上 115 的 callback，讓 115 在上傳完成後建立檔案。
+
+大檔分片上傳支援「斷點續傳」：分片上傳 ID 會透過 on_upload_id 交給呼叫端保存，
+中斷後再次上傳同一檔案時，以 ListParts 找出已完成的分片，只補傳缺少的部分。
+"""
 from __future__ import annotations
 
 import base64
 import json
 import logging
-import threading
 import time
 from typing import Callable
 
 from ..paths import long_path
-from .base import CloudError, ProgressFn
+from ..transfers import Cancelled, TransferControl
+from .base import CloudError
 
 log = logging.getLogger(__name__)
 
 TOKEN_MAX_AGE = 40 * 60  # STS 憑證約 1 小時有效，提早更新
-
-
-class UploadCancelled(CloudError):
-    pass
 
 
 def _b64(s: str) -> str:
@@ -43,8 +43,10 @@ def upload_to_oss(
     callback: str,
     callback_var: str,
     part_size: int,
-    progress: ProgressFn | None = None,
-    cancel: threading.Event | None = None,
+    control: TransferControl | None = None,
+    upload_id: str | None = None,
+    on_upload_id: Callable[[str], None] | None = None,
+    proxies: dict | None = None,
 ) -> dict:
     """上傳並回傳 115 callback 的 JSON（可能為空 dict）。"""
     import oss2  # 延遲載入：測試與秒傳不需要
@@ -55,29 +57,32 @@ def upload_to_oss(
         if force or state["bucket"] is None or time.time() - state["token_at"] > TOKEN_MAX_AGE:
             tok = token_provider()
             auth = oss2.StsAuth(tok["AccessKeyId"], tok["AccessKeySecret"], tok["SecurityToken"])
-            state["bucket"] = oss2.Bucket(auth, _endpoint(tok["endpoint"]), bucket_name)
+            kwargs = {"proxies": proxies} if proxies else {}
+            state["bucket"] = oss2.Bucket(auth, _endpoint(tok["endpoint"]), bucket_name, **kwargs)
             state["token_at"] = time.time()
         return state["bucket"]
 
-    def check_cancel():
-        if cancel is not None and cancel.is_set():
-            raise UploadCancelled("使用者取消上傳")
+    def check():
+        if control is not None:
+            control.check()
 
-    def retry(fn, what: str):
+    def retry(fn, what: str, base_done: int = 0):
         for attempt in range(4):
-            check_cancel()
+            check()
+            cb = control.progress_callback(base_done) if control is not None else None
             try:
-                return fn(bucket(force=attempt > 0))
+                return fn(bucket(force=attempt > 0), cb)
+            except Cancelled:
+                raise
             except oss2.exceptions.OssError as e:
                 if attempt == 3:
                     raise CloudError(f"OSS {what} 失敗：{e}") from e
                 log.warning("OSS %s 失敗（第 %d 次），重試：%s", what, attempt + 1, e)
-                time.sleep(2 ** attempt)
             except OSError as e:  # 網路中斷、NAS 讀取錯誤
                 if attempt == 3:
                     raise CloudError(f"{what} 失敗：{e}") from e
                 log.warning("%s 失敗（第 %d 次），重試：%s", what, attempt + 1, e)
-                time.sleep(2 ** attempt)
+            time.sleep(2 ** attempt)
 
     headers = {"x-oss-callback": _b64(callback)}
     if callback_var:
@@ -86,39 +91,42 @@ def upload_to_oss(
     with open(long_path(local_path), "rb") as f:
         if size <= part_size:
             data = f.read()
-
-            def put(b):
-                cb = (lambda done, total: progress(done, size)) if progress else None
-                return b.put_object(object_key, data, headers=headers, progress_callback=cb)
-
-            result = retry(put, "上傳")
+            result = retry(lambda b, cb: b.put_object(object_key, data, headers=headers, progress_callback=cb),
+                           "上傳")
         else:
-            upload_id = retry(lambda b: b.init_multipart_upload(object_key).upload_id, "建立分片上傳")
-            parts = []
-            done = 0
-            try:
-                part_no = 1
-                while True:
-                    check_cancel()
-                    chunk = f.read(part_size)
-                    if not chunk:
-                        break
-                    res = retry(lambda b, n=part_no, c=chunk: b.upload_part(object_key, upload_id, n, c),
-                                f"上傳分片 {part_no}")
-                    parts.append(oss2.models.PartInfo(part_no, res.etag, size=len(chunk), part_crc=res.crc))
-                    done += len(chunk)
-                    if progress:
-                        progress(done, size)
-                    part_no += 1
-                result = retry(lambda b: b.complete_multipart_upload(object_key, upload_id, parts, headers=headers),
-                               "完成分片上傳")
-            except BaseException:
+            done_parts: dict[int, object] = {}
+            if upload_id:
                 try:
-                    bucket().abort_multipart_upload(object_key, upload_id)
-                except Exception:  # noqa: BLE001 - 中止失敗不影響原錯誤
-                    pass
-                raise
-
+                    for p in oss2.PartIterator(bucket(), object_key, upload_id):
+                        done_parts[p.part_number] = p
+                    log.info("續傳 %s：已完成 %d 個分片", local_path, len(done_parts))
+                except oss2.exceptions.OssError as e:  # NoSuchUpload 等：重新開始
+                    log.info("無法續傳（%s），重新上傳 %s", getattr(e, "code", e), local_path)
+                    upload_id, done_parts = None, {}
+            if not upload_id:
+                upload_id = retry(lambda b, cb: b.init_multipart_upload(object_key).upload_id, "建立分片上傳")
+                if on_upload_id:
+                    on_upload_id(upload_id)
+            n_parts = (size + part_size - 1) // part_size
+            parts = []
+            for n in range(1, n_parts + 1):
+                check()
+                offset = (n - 1) * part_size
+                length = min(part_size, size - offset)
+                prev = done_parts.get(n)
+                if prev is not None and getattr(prev, "size", None) == length:
+                    parts.append(oss2.models.PartInfo(n, prev.etag, size=length))
+                    if control is not None:
+                        control.set_done(offset + length)
+                    continue
+                f.seek(offset)
+                chunk = f.read(length)
+                res = retry(lambda b, cb, n=n, c=chunk: b.upload_part(object_key, upload_id, n, c,
+                                                                      progress_callback=cb),
+                            f"上傳分片 {n}/{n_parts}", base_done=offset)
+                parts.append(oss2.models.PartInfo(n, res.etag, size=length, part_crc=res.crc))
+            result = retry(lambda b, cb: b.complete_multipart_upload(object_key, upload_id, parts, headers=headers),
+                           "完成分片上傳", base_done=size)
     try:
         body = result.resp.read()
         return json.loads(body) if body else {}

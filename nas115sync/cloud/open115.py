@@ -24,8 +24,9 @@ import requests
 
 from .. import __version__
 from ..hashing import FileHashes, sha1_range
-from ..paths import cloud_norm, cloud_parts, nfc
-from .base import AuthError, CloudClient, CloudEntry, CloudError, NotFoundError, ProgressFn, UploadResult
+from ..paths import cloud_norm, cloud_parts, long_path, nfc
+from ..transfers import TransferControl
+from .base import AuthError, CloudClient, CloudEntry, CloudError, NotFoundError, SessionStore, UploadResult
 
 log = logging.getLogger(__name__)
 
@@ -413,25 +414,109 @@ class Open115Client(CloudClient):
             return self._result(cid, name, hashes, True, d)
         return None
 
-    def upload(self, local_path: str, cid: str, name: str, hashes: FileHashes,
-               progress: ProgressFn | None = None, cancel: threading.Event | None = None) -> UploadResult:
-        from .oss_upload import upload_to_oss
-
-        d = self._init_with_sign_check(local_path, cid, name, hashes)
-        status = int(d.get("status") or 0)
-        if status == STATUS_INSTANT:
-            if progress:
-                progress(hashes.size, hashes.size)
-            return self._result(cid, name, hashes, True, d)
-        if status != STATUS_NEED_UPLOAD or not d.get("bucket") or not d.get("object"):
-            raise CloudError(f"115 upload/init 回傳未預期狀態 status={status}：{json.dumps(d, ensure_ascii=False)[:300]}")
+    @staticmethod
+    def _callback(d: dict) -> tuple[str, str]:
         cb = _first(d.get("callback"))
         if "value" in cb and isinstance(cb["value"], dict):
             cb = cb["value"]
-        body = upload_to_oss(
-            local_path, hashes.size, self._upload_token, str(d["bucket"]), str(d["object"]),
-            str(cb.get("callback") or ""), str(cb.get("callback_var") or ""), self.part_size, progress, cancel,
-        )
+        return str(cb.get("callback") or ""), str(cb.get("callback_var") or "")
+
+    def _resume_info(self, cid: str, h: FileHashes, pick_code: str) -> dict:
+        """115 斷點續傳：以先前的 pick_code 取回同一個上傳工作的 bucket/object/callback。"""
+        return _first(self._api("POST", "/open/upload/resume", data={
+            "file_size": str(h.size), "target": f"U_1_{cid}", "fileid": h.sha1.upper(), "pick_code": pick_code,
+        }).get("data"))
+
+    def upload(self, local_path: str, cid: str, name: str, hashes: FileHashes,
+               control: TransferControl | None = None, sessions: SessionStore | None = None) -> UploadResult:
+        from .oss_upload import upload_to_oss
+
+        sessions = sessions or SessionStore()
+        d = self._init_with_sign_check(local_path, cid, name, hashes)
+        status = int(d.get("status") or 0)
+        key = f"115|{cid}|{hashes.sha1}|{hashes.size}"
+        if status == STATUS_INSTANT:
+            sessions.delete(key)
+            return self._result(cid, name, hashes, True, d)
+        if status != STATUS_NEED_UPLOAD or not d.get("bucket") or not d.get("object"):
+            raise CloudError(f"115 upload/init 回傳未預期狀態 status={status}：{json.dumps(d, ensure_ascii=False)[:300]}")
+
+        bucket, obj = str(d["bucket"]), str(d["object"])
+        callback, callback_var = self._callback(d)
+        upload_id = None
+        sess = sessions.get(key)
+        if sess and sess.get("upload_id") and sess.get("part_size") == self.part_size and hashes.size > self.part_size:
+            try:
+                r = self._resume_info(cid, hashes, sess["pick_code"])
+                if str(r.get("object") or "") == sess.get("object"):
+                    bucket, obj = str(r.get("bucket") or sess["bucket"]), sess["object"]
+                    callback, callback_var = self._callback(r) if r.get("callback") else (callback, callback_var)
+                    upload_id = sess["upload_id"]
+            except CloudError as e:
+                log.info("115 續傳資訊無效，重新上傳 %s：%s", name, e)
+
+        def remember(uid: str) -> None:
+            sessions.put(key, {"pick_code": str(d.get("pick_code") or ""), "bucket": bucket, "object": obj,
+                               "upload_id": uid, "part_size": self.part_size, "name": name})
+
+        body = upload_to_oss(local_path, hashes.size, self._upload_token, bucket, obj, callback, callback_var,
+                             self.part_size, control, upload_id, remember, getattr(self.session, "proxies", None) or None)
         if body and (body.get("Code") or not _is_ok(body)):  # "Code" = OSS 端錯誤（如 CallbackFailed）
             raise CloudError(f"115 上傳回呼失敗：{json.dumps(body, ensure_ascii=False)[:300]}")
+        sessions.delete(key)
         return self._result(cid, name, hashes, False, _first(body.get("data")) if body else {})
+
+    # ------------------------------------------------------------ 下載／搜尋
+    def download_url(self, pick_code: str) -> str:
+        d = self._api("POST", "/open/ufile/downurl", data={"pick_code": pick_code}).get("data") or {}
+        info = next(iter(d.values()), {}) if isinstance(d, dict) else _first(d)
+        url = info.get("url")
+        url = url.get("url") if isinstance(url, dict) else url
+        if not url:
+            raise CloudError(f"115 未回傳下載網址：{json.dumps(d, ensure_ascii=False)[:200]}")
+        return str(url)
+
+    def download(self, fid: str, pick_code: str, dest_path: str, control: TransferControl | None = None) -> None:
+        url = self.download_url(pick_code)
+        lp = long_path(dest_path)
+        offset = os.path.getsize(lp) if os.path.exists(lp) else 0
+        headers = {"User-Agent": USER_AGENT}  # 115 要求下載時的 UA 與取得網址時相同
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        try:
+            with self.session.get(url, headers=headers, stream=True, timeout=self.timeout) as r:
+                if r.status_code == 416:  # 已下載完
+                    return
+                if r.status_code not in (200, 206):
+                    raise CloudError(f"下載失敗 HTTP {r.status_code}", r.status_code)
+                if offset and r.status_code == 200:  # 伺服器不支援續傳：從頭開始
+                    offset = 0
+                with open(lp, "ab" if offset else "wb") as f:
+                    if control is not None:
+                        control.set_done(offset)
+                    for chunk in r.iter_content(1024 * 1024):
+                        if not chunk:
+                            continue
+                        if control is not None:
+                            control.advance(len(chunk))
+                        f.write(chunk)
+        except requests.RequestException as e:
+            raise CloudError(f"下載中斷（可續傳）：{e}") from e
+
+    def search(self, keyword: str, cid: str = "0", limit: int = 500) -> list[CloudEntry]:
+        out: list[CloudEntry] = []
+        offset = 0
+        while len(out) < limit:
+            j = self._api("GET", "/open/ufile/search", params={
+                "search_value": keyword, "cid": cid, "limit": min(100, limit - len(out)), "offset": offset})
+            items = [parse_entry(it) for it in (j.get("data") or []) if isinstance(it, dict)]
+            if not items:
+                break
+            out += items
+            offset += len(items)
+            if offset >= int(j.get("count") or 0):
+                break
+        return out
+
+    def set_proxy(self, proxy: str) -> None:
+        self.session.proxies = {"http": proxy, "https": proxy} if proxy else {}

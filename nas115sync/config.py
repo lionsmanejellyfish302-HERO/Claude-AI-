@@ -20,8 +20,12 @@ DEFAULT_IGNORE = [
     "Thumbs.db", "desktop.ini", ".DS_Store", "._*", "@eaDir", "#recycle", "#snapshot",
     "@Recycle", "@Recently-Snapshot", ".@__thumb", ".SynologyWorkingDirectory",
     "$RECYCLE.BIN", "System Volume Information", "~$*", "*.tmp", "*.part",
-    "*.crdownload", "*.!qB", ".savedata_versions",
+    "*.crdownload", "*.!qB", ".savedata_versions", "*.115part", ".nas115sync_trash",
 ]
+
+UPLOAD, DOWNLOAD, TWO_WAY = "upload", "download", "two_way"
+DIRECTION_LABELS = {UPLOAD: "上傳（NAS → 115）", DOWNLOAD: "下載（115 → NAS）", TWO_WAY: "雙向同步（NAS ⇄ 115）"}
+DELETE_LABELS = {"": "依全域設定", "review": "交給本人核對", "auto": "自動同步刪除（可復原）", "ignore": "不處理刪除"}
 
 # 資料夾名稱符合任一項（不分大小寫）即視為遊戲存檔群組
 DEFAULT_SAVEDATA_DIRS = [
@@ -59,10 +63,36 @@ class Mapping:
     # 整個對應都是遊戲存檔（例如 NAS 上的「Saved Games」）；每個第一層子資料夾為一個存檔群組
     savedata: bool = False
     note: str = ""
+    direction: str = UPLOAD  # upload / download / two_way
+    delete_mode: str = ""  # ""=依全域 deletion_policy；review / auto / ignore
+    account_id: str = "default"
+    # 篩選：檔名或相對路徑（含 / 時）符合 include 才同步（空白=全部）；符合 exclude 則不同步
+    include_patterns: list = field(default_factory=list)
+    exclude_patterns: list = field(default_factory=list)
+    min_size: int = 0  # bytes，0 = 不限
+    max_size: int = 0
+    skip_hidden: bool = False
 
     @property
     def active(self) -> bool:
         return self.confirmed and self.enabled
+
+    @property
+    def can_upload(self) -> bool:
+        return self.direction in (UPLOAD, TWO_WAY)
+
+    @property
+    def can_download(self) -> bool:
+        return self.direction in (DOWNLOAD, TWO_WAY)
+
+    def delete_policy(self, settings: "Settings") -> str:
+        return self.delete_mode or settings.deletion_policy
+
+
+@dataclass
+class Account:
+    id: str
+    label: str
 
 
 @dataclass
@@ -96,6 +126,21 @@ class Settings:
     # 先對所有待上傳檔案嘗試秒傳，再處理需實際上傳的檔案
     instant_first: bool = True
     browser_path: str = ""
+    # 限速（KB/s，0 = 不限）
+    upload_limit_kb: int = 0
+    download_limit_kb: int = 0
+    proxy: str = ""  # 例如 http://127.0.0.1:7890
+    # 實際上傳後向 115 讀回 SHA-1 驗證
+    verify_uploads: bool = True
+    # 一般檔案：上傳新版後 115 舊版保留份數（0 = 刪除）
+    keep_versions: int = 0
+    # 下載覆蓋或刪除 NAS 檔案前，先把舊檔移到對應根目錄下的這個資料夾（可復原）
+    local_trash_dir: str = ".nas115sync_trash"
+    local_trash_days: int = 30
+    # 雙向/下載模式的存檔群組多久檢查一次 115 是否有新存檔（秒）
+    savedata_cloud_poll_seconds: int = 120
+    # 排程：[{"id","enabled","time":"03:00","days":[0..6],"action":"sync"|"scan","mapping_ids":[]}]
+    schedules: list = field(default_factory=list)
 
 
 def _filtered(cls, data: dict) -> dict:
@@ -108,6 +153,7 @@ class Config:
         self.path = Path(path) if path else app_home() / "config.json"
         self.settings = Settings()
         self.mappings: list[Mapping] = []
+        self.accounts: list[Account] = [Account("default", "115 帳號")]
         self._lock = threading.RLock()
         self.load()
 
@@ -118,12 +164,16 @@ class Config:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.settings = Settings(**_filtered(Settings, data.get("settings", {})))
             self.mappings = [Mapping(**_filtered(Mapping, m)) for m in data.get("mappings", [])]
+            accounts = [Account(**_filtered(Account, a)) for a in data.get("accounts", [])]
+            if accounts:
+                self.accounts = accounts
 
     def save(self) -> None:
         with self._lock:
             data = {
                 "settings": asdict(self.settings),
                 "mappings": [asdict(m) for m in self.mappings],
+                "accounts": [asdict(a) for a in self.accounts],
             }
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -132,11 +182,12 @@ class Config:
     def get_mapping(self, mapping_id: str) -> Mapping | None:
         return next((m for m in self.mappings if m.id == mapping_id), None)
 
-    def add_mapping(self, local_path: str, cloud_path: str, savedata: bool = False) -> Mapping:
+    def add_mapping(self, local_path: str, cloud_path: str, savedata: bool = False, **options) -> Mapping:
         from .paths import cloud_norm
 
         with self._lock:
-            m = Mapping(local_path=local_path, cloud_path=cloud_norm(cloud_path), savedata=savedata)
+            m = Mapping(local_path=local_path, cloud_path=cloud_norm(cloud_path), savedata=savedata,
+                        **_filtered(Mapping, options))
             self.mappings.append(m)
             self.save()
             return m
@@ -166,3 +217,22 @@ class Config:
 
     def active_mappings(self) -> list[Mapping]:
         return [m for m in self.mappings if m.active]
+
+    def get_account(self, account_id: str) -> Account | None:
+        return next((a for a in self.accounts if a.id == account_id), None)
+
+    def add_account(self, label: str) -> Account:
+        with self._lock:
+            a = Account(uuid.uuid4().hex[:8], label)
+            self.accounts.append(a)
+            self.save()
+            return a
+
+    def remove_account(self, account_id: str) -> None:
+        if account_id == "default":
+            raise ValueError("預設帳號不能刪除")
+        if any(m.account_id == account_id for m in self.mappings):
+            raise ValueError("仍有路徑對應使用此帳號")
+        with self._lock:
+            self.accounts = [a for a in self.accounts if a.id != account_id]
+            self.save()

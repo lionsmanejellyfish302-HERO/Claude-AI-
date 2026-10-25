@@ -154,7 +154,8 @@ def test_upload_falls_back_to_oss(tmp_path, monkeypatch):
     h = hash_file(str(f))
     captured = {}
 
-    def fake_oss(local_path, size, token_provider, bucket, obj, callback, callback_var, part_size, progress, cancel):
+    def fake_oss(local_path, size, token_provider, bucket, obj, callback, callback_var, part_size, control,
+                 upload_id, on_upload_id, proxies):
         captured.update(bucket=bucket, obj=obj, callback=callback, callback_var=callback_var,
                         token=token_provider())
         return {"state": True, "code": 0, "data": {"file_id": "F9", "pick_code": "P9"}}
@@ -194,3 +195,102 @@ def test_endpoint_upgraded_to_https():
     from nas115sync.cloud.oss_upload import _endpoint
 
     assert _endpoint("http://oss-cn-shenzhen.aliyuncs.com") == "https://oss-cn-shenzhen.aliyuncs.com"
+
+
+class StreamResp(Resp):
+    def __init__(self, data: bytes, status=200):
+        super().__init__({}, status)
+        self.data = data
+
+    def iter_content(self, n):
+        for i in range(0, len(self.data), n):
+            yield self.data[i:i + n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_download_with_resume(tmp_path):
+    content = bytes(range(256)) * 100
+    seen = {}
+
+    def downurl(params, data, headers):
+        seen["pick"] = data["pick_code"]
+        return ok({"777": {"file_name": "f.bin", "url": {"url": "https://cdn.115.com/dl/f.bin"}}})
+
+    class DlSession(FakeSession):
+        def get(self, url, params=None, timeout=None, headers=None, stream=False):
+            if "cdn.115.com" in url:
+                seen["range"] = (headers or {}).get("Range")
+                start = int(seen["range"].split("=")[1].rstrip("-")) if seen["range"] else 0
+                return StreamResp(content[start:], 206 if start else 200)
+            return super().get(url, params=params, timeout=timeout)
+
+    store = TokenStore(tmp_path / "tokens.json")
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": 9e12})
+    c = Open115Client(store, min_interval=0, session=DlSession({("POST", "/open/ufile/downurl"): downurl}))
+    dest = tmp_path / "f.bin"
+    dest.write_bytes(content[:1000])  # 部分內容
+    c.download("777", "PICK", str(dest))
+    assert seen["pick"] == "PICK" and seen["range"] == "bytes=1000-"
+    assert dest.read_bytes() == content
+
+
+def test_search(tmp_path):
+    def search(params, data, headers):
+        assert params["search_value"] == "報告" and params["cid"] == "5"
+        return Resp({"state": True, "count": 1, "data": [
+            {"file_id": "9", "file_name": "年度報告.pdf", "file_size": "12", "sha1": "ab", "pick_code": "p9",
+             "parent_id": "5", "file_category": "1"}]})
+
+    c = make_client(tmp_path, {("GET", "/open/ufile/search"): search})
+    [e] = c.search("報告", "5")
+    assert e.name == "年度報告.pdf" and e.size == 12 and e.pid == "5" and not e.is_dir
+
+
+def test_upload_resume_uses_saved_session(tmp_path, monkeypatch):
+    from nas115sync.cloud.base import SessionStore
+
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"q" * 5000)
+    h = hash_file(str(f))
+
+    class Mem(SessionStore):
+        def __init__(self):
+            self.d = {}
+
+        def get(self, k):
+            return self.d.get(k)
+
+        def put(self, k, v):
+            self.d[k] = v
+
+        def delete(self, k):
+            self.d.pop(k, None)
+
+    sessions = Mem()
+    key = f"115|42|{h.sha1}|{h.size}"
+    sessions.put(key, {"pick_code": "OLDPC", "bucket": "fhnfile", "object": "obj/old", "upload_id": "UID",
+                       "part_size": 1000})
+    captured = {}
+
+    def fake_oss(local_path, size, token_provider, bucket, obj, callback, callback_var, part_size, control,
+                 upload_id, on_upload_id, proxies):
+        captured.update(obj=obj, upload_id=upload_id)
+        return {"state": True, "data": {"file_id": "F1"}}
+
+    monkeypatch.setattr("nas115sync.cloud.oss_upload.upload_to_oss", fake_oss)
+    c = make_client(tmp_path, {
+        ("POST", "/open/upload/init"): lambda p, d, hd: ok({"status": 1, "bucket": "fhnfile", "object": "obj/new",
+                                                             "pick_code": "NEWPC", "callback": {"callback": "{}"}}),
+        ("POST", "/open/upload/resume"): lambda p, d, hd: ok({"bucket": "fhnfile", "object": "obj/old",
+                                                               "callback": {"callback": "{}"}}),
+    })
+    c.part_size = 1000
+    res = c.upload(str(f), "42", "big.bin", h, sessions=sessions)
+    assert res.fid == "F1"
+    assert captured == {"obj": "obj/old", "upload_id": "UID"}
+    assert sessions.get(key) is None  # 完成後清除

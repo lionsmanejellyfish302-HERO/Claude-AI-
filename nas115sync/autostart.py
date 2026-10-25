@@ -41,11 +41,13 @@ def set_enabled(enabled: bool) -> None:
         raise OSError("只支援 Windows")
     import winreg
 
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-        if enabled:
+    if enabled:
+        # 新建立的使用者帳號可能還沒有 Run 機碼：不存在時建立
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, VALUE_NAME, 0, winreg.REG_SZ, launch_command())
-        else:
-            try:
-                winreg.DeleteValue(k, VALUE_NAME)
-            except FileNotFoundError:
-                pass
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, VALUE_NAME)
+    except FileNotFoundError:  # 沒有機碼或沒有這個值：本來就沒有開機啟動
+        pass

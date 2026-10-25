@@ -9,7 +9,15 @@ from ..app import open_in_115_browser
 from ..config import DELETE_LABELS, DIRECTION_LABELS
 from ..mapping_check import inspect_mapping, suggest_mappings
 from ..paths import cloud_norm
-from .util import open_local, scrolled_text, set_text, tree_with_scroll
+from . import theme
+from .theme import XS, XXL, L, M, S, px
+from .util import open_local, scrolled_text, set_text, tree_with_scroll, wrap_label
+
+
+def _round_poly(x1: int, y1: int, x2: int, y2: int, r: int) -> list[int]:
+    """畫圓角矩形用的多邊形頂點（搭配 smooth=True）。"""
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
 
 
 class _Dialog(tk.Toplevel):
@@ -19,12 +27,16 @@ class _Dialog(tk.Toplevel):
         self.transient(parent)
         self.resizable(True, True)
         self.result = None
-        self.body = ttk.Frame(self, padding=12)
+        self.body = ttk.Frame(self, padding=px(L))
         self.body.pack(fill="both", expand=True)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        theme.apply_titlebar(self)
 
     def center(self, w: int, h: int) -> None:
+        """置中於主視窗；大小至少要容納內容（字型與縮放比例不同時，內容需要的空間也不同）。"""
         self.update_idletasks()
+        w = min(max(w, self.winfo_reqwidth()), self.winfo_screenwidth() - px(L))
+        h = min(max(h, self.winfo_reqheight()), self.winfo_screenheight() - px(XXL))
         p = self.master
         x = p.winfo_rootx() + max(0, (p.winfo_width() - w) // 2)
         y = p.winfo_rooty() + max(0, (p.winfo_height() - h) // 3)
@@ -59,7 +71,7 @@ class AddMappingDialog(_Dialog):
         self.cloud = tk.StringVar(value=m.cloud_path if m else "")
         ttk.Entry(b, textvariable=self.cloud, width=60).grid(row=3, column=0, sticky="we")
 
-        opts = ttk.LabelFrame(b, text="同步方式", padding=8)
+        opts = ttk.LabelFrame(b, text="同步方式", padding=px(M))
         opts.grid(row=4, column=0, columnspan=2, sticky="we", pady=8)
         ttk.Label(opts, text="方向：").grid(row=0, column=0, sticky="w")
         self.direction = ttk.Combobox(opts, state="readonly", width=26, values=list(DIRECTION_LABELS.values()))
@@ -78,7 +90,7 @@ class AddMappingDialog(_Dialog):
         ttk.Checkbutton(opts, text="整個資料夾都是遊戲存檔（每個子資料夾為一個遊戲）", variable=self.savedata).grid(
             row=1, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(6, 0))
 
-        flt = ttk.LabelFrame(b, text="篩選（選填）", padding=8)
+        flt = ttk.LabelFrame(b, text="篩選（選填）", padding=px(M))
         flt.grid(row=5, column=0, columnspan=2, sticky="we")
         ttk.Label(flt, text="只同步（例如 *.jpg *.mp4）：").grid(row=0, column=0, sticky="w")
         self.include = tk.StringVar(value=" ".join(m.include_patterns) if m else "")
@@ -99,13 +111,13 @@ class AddMappingDialog(_Dialog):
         flt.columnconfigure(1, weight=1)
 
         ttk.Label(b, text="新增或變更路徑後狀態為「待核對」，需按「核對確認」由本人確認後才會同步。",
-                  foreground="#a05000").grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                  style="Warning.TLabel").grid(row=6, column=0, columnspan=2, sticky="w", pady=(px(S), 0))
         bar = ttk.Frame(b)
-        bar.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(bar, text="確定", command=self._ok).pack(side="left", padx=4)
-        ttk.Button(bar, text="取消", command=self.destroy).pack(side="left")
+        bar.grid(row=7, column=0, columnspan=2, sticky="e", pady=(px(L), 0))
+        ttk.Button(bar, text="確定", style="Accent.TButton", command=self._ok).pack(side="right")
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=(0, px(S)))
         b.columnconfigure(0, weight=1)
-        self.center(780, 560)
+        self.center(px(860), px(560))
 
     def _browse(self):
         d = filedialog.askdirectory(parent=self, title="選擇 NAS 資料夾")
@@ -166,10 +178,10 @@ class SuggestDialog(_Dialog):
         bar.pack(anchor="e")
         ttk.Button(bar, text="全選", command=lambda: self.tree.selection_set(self.tree.get_children())).pack(
             side="left", padx=4)
-        ttk.Button(bar, text="加入選取項目", command=self._ok).pack(side="left", padx=4)
-        ttk.Button(bar, text="取消", command=self.destroy).pack(side="left")
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="left", padx=(0, px(S)))
+        ttk.Button(bar, text="加入選取項目", style="Accent.TButton", command=self._ok).pack(side="left")
         self.items = {}
-        self.center(780, 520)
+        self.center(px(800), px(520))
 
     def _browse(self):
         d = filedialog.askdirectory(parent=self, title="選擇 NAS 根目錄")
@@ -220,7 +232,7 @@ class ConfirmMappingDialog(_Dialog):
         self.m, self.cloud, self.ui, self.browser_path = mapping, cloud, ui, browser_path
         self.info = None
         b = self.body
-        ttk.Label(b, text="請核對 NAS 與 115 兩邊的路徑與內容是否為同一份資料：", font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(b, text="請核對 NAS 與 115 兩邊的路徑與內容是否為同一份資料", style="Section.TLabel").pack(anchor="w")
         self.text = scrolled_text(b, height=22, wrap="char")
         self.text.frame.pack(fill="both", expand=True, pady=6)
         set_text(self.text, "讀取 NAS 與 115 內容中…")
@@ -235,10 +247,10 @@ class ConfirmMappingDialog(_Dialog):
         ttk.Button(bar, text="開啟 NAS 資料夾", command=lambda: open_local(self.m.local_path)).pack(side="left")
         self.open115 = ttk.Button(bar, text="在 115 瀏覽器開啟", command=self._open115, state="disabled")
         self.open115.pack(side="left", padx=4)
-        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right")
-        self.ok = ttk.Button(bar, text="確認對應", command=self._ok, state="disabled")
-        self.ok.pack(side="right", padx=4)
-        self.center(760, 620)
+        self.ok = ttk.Button(bar, text="確認對應", style="Accent.TButton", command=self._ok, state="disabled")
+        self.ok.pack(side="right")
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=(0, px(S)))
+        self.center(px(780), px(640))
         threading.Thread(target=self._load, args=(mappings,), daemon=True).start()
 
     def _load(self, mappings):
@@ -288,26 +300,36 @@ class QrLoginDialog(_Dialog):
         self._closed = threading.Event()
         self._devices = LOGIN_DEVICES
         b = self.body
-        ttk.Label(b, text="用手機 115 App 掃描 QR 碼並確認（與 115 電腦版是同一個帳號、同一個網盤）。",
-                  wraplength=400).pack(anchor="w")
+        wrap_label(b, "用手機 115 App 掃描 QR 碼並確認（與 115 電腦版是同一個帳號、同一個網盤）。",
+                   style="TLabel").pack(fill="x")
         row = ttk.Frame(b)
-        row.pack(fill="x", pady=(8, 0))
-        ttk.Label(row, text="登入裝置欄位：").pack(side="left")
-        self.device = ttk.Combobox(row, state="readonly", width=34, values=list(LOGIN_DEVICES.values()))
+        row.pack(fill="x", pady=(px(M), 0))
+        ttk.Label(row, text="登入裝置欄位").pack(side="left", padx=(0, px(S)))
+        self.device = ttk.Combobox(row, state="readonly", width=20, values=list(LOGIN_DEVICES.values()),
+                                   style="Popup.TCombobox")
         self.device.set(LOGIN_DEVICES.get(getattr(cloud, "device", DEFAULT_DEVICE), LOGIN_DEVICES[DEFAULT_DEVICE]))
-        self.device.pack(side="left")
-        ttk.Label(b, text="115 每種裝置只允許一個登入：請選你「沒有在用」的裝置，否則該裝置上的 115 會被登出。\n"
-                          "預設的「支付寶小程序」不會影響 115 電腦版與手機 App。",
-                  foreground="#a05000", wraplength=400).pack(anchor="w", pady=(4, 0))
-        self.start_btn = ttk.Button(b, text="顯示 QR 碼", command=self.start)
-        self.start_btn.pack(pady=(8, 0))
-        self.canvas = tk.Canvas(b, width=300, height=300, bg="white", highlightthickness=0)
-        self.canvas.pack(pady=10)
-        self.status = ttk.Label(b, text="選好裝置欄位後按「顯示 QR 碼」")
+        self.device.pack(side="left", fill="x", expand=True)
+        wrap_label(b, "115 每種裝置只允許一個登入：請選你「沒有在用」的裝置，否則該裝置上的 115 會被登出。\n"
+                      "預設的「支付寶小程序」不會影響 115 電腦版與手機 App。",
+                   style="Warning.TLabel").pack(fill="x", pady=(px(XS), 0))
+        bar = ttk.Frame(b)  # 與 macOS 對話框相同：按鈕在右下角，主要動作在最右邊
+        bar.pack(side="bottom", fill="x", pady=(px(L), 0))
+        self.start_btn = ttk.Button(bar, text="顯示 QR 碼", style="Accent.TButton", command=self.start)
+        self.start_btn.pack(side="right")
+        ttk.Button(bar, text="取消", command=self.close).pack(side="right", padx=(0, px(S)))
+        # QR 碼區：233 = 費氏數列；顯示前是淡色的圓角虛線框
+        self.qr_size = px(233)
+        p = theme.P
+        self.canvas = tk.Canvas(b, width=self.qr_size, height=self.qr_size, bg=p.card, highlightthickness=0)
+        self.canvas.pack(pady=(px(L), px(S)))
+        q, r = self.qr_size - 2, px(13)
+        self.canvas.create_polygon(_round_poly(1, 1, q, q, r), fill="", outline=p.text3, dash=(4, 4), smooth=True)
+        self.canvas.create_text(self.qr_size // 2, self.qr_size // 2, text="QR 碼會顯示在這裡", fill=p.text3,
+                                font="NSCaption")
+        self.status = ttk.Label(b, text="選好裝置欄位後按「顯示 QR 碼」", style="Secondary.TLabel")
         self.status.pack()
-        ttk.Button(b, text="取消", command=self.close).pack(pady=(8, 0))
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.center(440, 560)
+        self.center(px(460), px(560))
 
     def start(self):
         device = next((k for k, v in self._devices.items() if v == self.device.get()), None)
@@ -323,16 +345,18 @@ class QrLoginDialog(_Dialog):
     def _draw(self, text: str):
         if not self.winfo_exists():
             return
+        self.canvas.delete("all")
+        self.canvas.configure(bg="white")  # QR 碼一律白底黑點，深色模式下手機才掃得到
         try:
             import qrcode
         except ImportError:
-            self.canvas.create_text(150, 150, text=text, width=280)
+            self.canvas.create_text(self.qr_size // 2, self.qr_size // 2, text=text, width=self.qr_size - px(S))
             return
         qr = qrcode.QRCode(border=2)
         qr.add_data(text)
         qr.make(fit=True)
         mat = qr.get_matrix()
-        scale = max(2, 300 // len(mat))
+        scale = max(2, self.qr_size // len(mat))
         size = scale * len(mat)
         self.canvas.configure(width=size, height=size)
         for y, row in enumerate(mat):

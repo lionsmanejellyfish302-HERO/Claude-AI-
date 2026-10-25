@@ -1,8 +1,9 @@
-"""NAS115Sync 圖形介面（Tkinter，Windows 11 原生外觀）。"""
+"""NAS115Sync 圖形介面（Tkinter）：Apple 設計美學（側邊欄、圓角卡片、大標題、留白），比例依黃金分割。"""
 from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -11,19 +12,22 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .. import __version__, autostart
 from ..app import App, RedactSecrets, make_client, open_in_115_browser, resource_path, single_instance
+from ..check115 import run_check
 from ..compare import DECISIONS, KIND_LABELS, SAVEDATA_GROUP, available_decisions
 from ..config import DIRECTION_LABELS, Settings
 from ..engine import Cancelled
-from ..check115 import run_check
 from ..manual import export_plans_csv
 from ..paths import local_join, rel_parent
 from ..scheduler import WEEKDAYS, Scheduler, describe, new_schedule
 from ..watcher import RealtimeSync
+from . import theme
 from .browser import BrowserTab
 from .dialogs import AddMappingDialog, ConfirmMappingDialog, QrLoginDialog, SuggestDialog
+from .sidebar import Sidebar
 from .tabs import DuplicatesTab, TransfersTab
-from .util import (QueueLogHandler, UiQueue, enable_dpi_awareness, fmt_time, human_size, open_local,
-                   scrolled_text, set_text, setup_fonts, tree_with_scroll)
+from .theme import MAJOR, MINOR, XL, XS, XXL, XXS, L, M, S, px
+from .util import (AutoScrollbar, Flow, QueueLogHandler, UiQueue, enable_dpi_awareness, fmt_time, human_size,
+                   open_local, scrolled_text, set_text, setup_fonts, tree_with_scroll, wrap_label)
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +66,21 @@ SETTING_FIELDS = [
     ("part_size_mb", "大檔分片大小（MB）", "int"),
     ("browser_path", "115 瀏覽器執行檔（空白 = 自動尋找）", "str"),
     ("ignore_patterns", "忽略的檔名規則（每行一個，支援 * ?）", "lines"),
+    ("appearance", "外觀（重新啟動程式後生效）", "choice",
+     [("auto", "跟隨 Windows"), ("light", "淺色"), ("dark", "深色")]),
+]
+# 設定頁分組（像 macOS 系統設定的分組卡片）
+SETTING_GROUPS = [
+    ("同步與核對", ["auto_update_linked", "deletion_policy", "review_same_name_elsewhere", "mass_delete_guard_min",
+                "mass_delete_guard_ratio", "instant_first", "verify_uploads", "keep_versions"]),
+    ("即時同步", ["stable_seconds", "cloud_poll_seconds", "rescan_interval_minutes", "use_polling_observer",
+              "polling_interval_seconds"]),
+    ("遊戲存檔", ["savedata_dir_names", "savedata_extensions", "savedata_quiet_seconds", "savedata_keep_versions",
+              "savedata_mirror_deletes", "savedata_cloud_poll_seconds"]),
+    ("NAS 端", ["local_trash_dir", "local_trash_days", "ignore_patterns"]),
+    ("傳輸與網路", ["upload_limit_kb", "download_limit_kb", "upload_workers", "hash_workers", "part_size_mb",
+               "api_min_interval", "proxy", "browser_path"]),
+    ("外觀", ["appearance"]),
 ]
 
 
@@ -78,30 +97,39 @@ class MainWindow:
         self.review_items: dict[str, object] = {}
         self.group_items: dict[str, tuple] = {}
 
-        root.title(f"NAS115Sync {__version__} — NAS ⇄ 115 網盤比對與即時同步" + ("（示範模式）" if app.demo else ""))
-        root.geometry("1200x780")
-        root.minsize(980, 620)
-        style = ttk.Style(root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("Big.TButton", padding=(12, 6))
+        root.title(f"NAS115Sync {__version__}" + ("（示範模式）" if app.demo else ""))
+        theme.build(root, getattr(self.config.settings, "appearance", "auto"))
+        # 1294×800（長寬比 φ），螢幕較小（例如 1366×768 筆電）時縮小到放得下，並置中
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight() - px(XXL)  # 扣掉工作列
+        w, h = min(px(theme.WINDOW[0]), sw - px(L)), min(px(theme.WINDOW[1]), sh - px(L))
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(min(px(theme.MIN_WINDOW[0]), w), min(px(theme.MIN_WINDOW[1]), h))
 
-        self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        shell = ttk.Frame(root, style="Page.TFrame")
+        shell.pack(fill="both", expand=True)
+        self.sidebar = Sidebar(shell, self._nav, subtitle="NAS ⇄ 115 網盤" + ("・示範模式" if app.demo else ""))
+        self.sidebar.pack(side="left", fill="y")
+        main = ttk.Frame(shell, style="Page.TFrame")
+        main.pack(side="left", fill="both", expand=True)
+        self.nb = ttk.Notebook(main, style="Hidden.TNotebook")
+        self.nb.pack(fill="both", expand=True)
         self._build_dashboard()
-        self.tab_browser = self._new_tab("瀏覽（NAS ⇄ 115）")
-        self.browser = BrowserTab(self, self.tab_browser)
-        self.tab_transfers = self._new_tab("傳輸")
-        self.transfers_tab = TransfersTab(self, self.tab_transfers)
+        self.tab_browser = self._new_tab("瀏覽", "左邊 NAS、右邊 115：上傳、下載、比較、整理檔案", "folder")
+        self.browser = BrowserTab(self, self.tab_browser.body)
+        self.tab_transfers = self._new_tab("傳輸", "每個檔案的進度與速度；可暫停、取消、限速", "transfer")
+        self.transfers_tab = TransfersTab(self, self.tab_transfers.body)
         self._build_mappings()
         self._build_reviews()
         self._build_savedata()
-        self.tab_dupes = self._new_tab("重複檔案")
-        self.dupes_tab = DuplicatesTab(self, self.tab_dupes)
+        self.tab_dupes = self._new_tab("重複檔案", "依 SHA-1 找出 NAS 與 115 上內容相同的檔案", "copy")
+        self.dupes_tab = DuplicatesTab(self, self.tab_dupes.body)
         self._build_log()
         self._build_settings()
-        self.statusbar = ttk.Label(root, text="就緒", anchor="w", padding=(10, 4))
+        self.statusbar = ttk.Label(main, text="就緒", anchor="w", style="Status.TLabel",
+                                   padding=(px(XL), px(XS), px(XL), px(S)))
         self.statusbar.pack(fill="x")
+        self.sidebar.select(self.nb.select())
+        theme.apply_titlebar(root)
 
         self._log_handler = QueueLogHandler(self.ui, self._append_log)
         self._log_handler.addFilter(RedactSecrets())
@@ -120,10 +148,23 @@ class MainWindow:
         if start_realtime:
             root.after(1500, self.toggle_realtime)
 
-    def _new_tab(self, title: str) -> ttk.Frame:
-        f = ttk.Frame(self.nb, padding=10)
-        self.nb.add(f, text=title)
-        return f
+    def _new_tab(self, title: str, subtitle: str, icon: str, card: bool = True) -> ttk.Frame:
+        """一個頁面：大標題＋說明，內容放在 page.body（白色圓角卡片）。"""
+        page = ttk.Frame(self.nb, style="Page.TFrame", padding=(px(XL), px(L), px(XL), 0))
+        page.header = ttk.Frame(page, style="Page.TFrame")  # type: ignore[attr-defined]
+        page.header.pack(fill="x", pady=(0, px(M)))
+        ttk.Label(page.header, text=title, style="PageTitle.TLabel").pack(anchor="w")
+        if subtitle:
+            ttk.Label(page.header, text=subtitle, style="PageSubtitle.TLabel").pack(anchor="w", pady=(px(XXS), 0))
+        if card:
+            page.body = theme.card(page)  # type: ignore[attr-defined]
+            page.body.pack(fill="both", expand=True)
+        self.nb.add(page, text=title)
+        self.sidebar.add(str(page), title, icon)
+        return page
+
+    def _nav(self, key: str) -> None:
+        self.nb.select(key)
 
     # 提供給其他分頁使用
     def set_status(self, text: str) -> None:
@@ -255,60 +296,93 @@ class MainWindow:
 
     # ================================================================ 總覽
     def _build_dashboard(self) -> None:
-        f = self.tab_dashboard = self._new_tab("總覽")
+        page = self.tab_dashboard = self._new_tab("總覽", "NAS 與 115 網盤的比對與即時同步", "home", card=False)
+        grid = ttk.Frame(page, style="Page.TFrame")
+        grid.pack(fill="both", expand=True)
+        # 黃金分割：左欄 : 右欄 = 0.382 : 0.618
+        grid.columnconfigure(0, weight=round(MINOR * 1000), uniform="golden")
+        grid.columnconfigure(1, weight=round(MAJOR * 1000), uniform="golden")
+        grid.rowconfigure(1, weight=1)
+        gap = px(M)
 
-        acct = ttk.LabelFrame(f, text="115 帳號（可多個）", padding=10)
-        acct.pack(fill="x")
-        self.acct_combo = ttk.Combobox(acct, state="readonly", width=16)
-        self.acct_combo.pack(side="left")
+        acct = theme.card(grid)
+        acct.grid(row=0, column=0, sticky="nsew", padx=(0, gap), pady=(0, gap))
+        ttk.Label(acct, text="115 帳號", style="Section.TLabel").pack(anchor="w")
+        row = ttk.Frame(acct)
+        row.pack(fill="x", pady=(px(S), 0))
+        self.acct_combo = ttk.Combobox(row, state="readonly", width=14, style="Popup.TCombobox")
+        self.acct_combo.pack(side="left", fill="x", expand=True)
         self.acct_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_account())
-        ttk.Button(acct, text="＋", width=3, command=self.add_account).pack(side="left", padx=(4, 0))
-        ttk.Button(acct, text="－", width=3, command=self.remove_account).pack(side="left", padx=(2, 10))
-        self.acct_label = ttk.Label(acct, text="檢查中…", font=("", 11, "bold"))
-        self.acct_label.pack(side="left")
-        self.btn_logout = ttk.Button(acct, text="登出", command=self.logout)
-        self.btn_logout.pack(side="right")
-        ttk.Button(acct, text="115 連線測試", command=self.check_115).pack(side="right", padx=4)
-        self.btn_qr = ttk.Button(acct, text="115 App 掃碼登入", command=self.login_qr)
-        self.btn_qr.pack(side="right")
+        ttk.Button(row, text=theme.icon("add"), style="Icon.TButton", command=self.add_account).pack(
+            side="left", padx=(px(S), 0))
+        ttk.Button(row, text=theme.icon("remove"), style="Icon.TButton", command=self.remove_account).pack(
+            side="left", padx=(px(XS), 0))
+        self.acct_label = ttk.Label(acct, text="檢查中…", style="Secondary.TLabel")
+        self.acct_label.pack(anchor="w", pady=(px(S), px(S)))
+        bar = Flow(acct)
+        bar.pack(fill="x")
+        self.btn_qr = ttk.Button(bar, text="115 App 掃碼登入", style="Accent.TButton", command=self.login_qr)
+        self.btn_check = ttk.Button(bar, text="115 連線測試", command=self.check_115)
+        self.btn_logout = ttk.Button(bar, text="登出", command=self.logout)
+        bar.add(self.btn_qr, self.btn_check, self.btn_logout)
         if self.app.demo:
             for b in (self.btn_logout, self.btn_qr):
                 b.configure(state="disabled")
         self._fill_accounts()
 
-        act = ttk.LabelFrame(f, text="同步", padding=10)
-        act.pack(fill="x", pady=10)
-        row = ttk.Frame(act)
+        act = theme.card(grid)
+        act.grid(row=0, column=1, sticky="nsew", pady=(0, gap))
+        ttk.Label(act, text="同步", style="Section.TLabel").pack(anchor="w")
+        wrap_label(act, "掃描比對：讀取 NAS 與 115、計算 MD5/SHA-1 並三方比對（不傳輸）。"
+                        "執行同步：處理可自動完成的項目（上傳秒傳優先），需要判斷的交給「待核對」。").pack(
+            fill="x", pady=(px(XXS), px(M)))
+        row = Flow(act)
         row.pack(fill="x")
-        ttk.Button(row, text="① 掃描比對", style="Big.TButton", command=self.scan).pack(side="left")
-        ttk.Button(row, text="② 執行同步", style="Big.TButton", command=self.execute).pack(side="left", padx=6)
-        self.rt_btn = ttk.Button(row, text="▶ 開始即時同步", style="Big.TButton", command=self.toggle_realtime)
-        self.rt_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(row, text="取消目前工作", command=self.cancel, state="disabled")
-        self.cancel_btn.pack(side="left", padx=6)
-        ttk.Button(row, text="匯出比對報告（CSV）", command=self.export_csv).pack(side="right")
-        ttk.Label(act, text="① 掃描 NAS 與 115、計算 MD5/SHA-1 並三方比對（不會傳輸）；"
-                            "② 執行可自動處理的項目（上傳秒傳優先、下載先從 NAS 複製相同檔）；需本人核對的到「待核對」頁。",
-                  foreground="#555").pack(anchor="w", pady=(6, 0))
+        self.btn_scan = ttk.Button(row, text="掃描比對", style="Large.TButton", command=self.scan)
+        self.btn_sync = ttk.Button(row, text="執行同步", style="Large.Accent.TButton", command=self.execute)
+        self.rt_btn = ttk.Button(row, text="開始即時同步", style="Large.TButton", command=self.toggle_realtime)
+        self.cancel_btn = ttk.Button(row, text="取消目前工作", command=self.cancel, state="disabled",
+                                     style="Link.TButton")
+        self.btn_csv = ttk.Button(row, text="匯出比對報告（CSV）", style="Link.TButton", command=self.export_csv)
+        row.add(self.btn_scan, self.btn_sync, self.rt_btn, self.cancel_btn, self.btn_csv)
         self.progress = ttk.Progressbar(act, mode="determinate")
-        self.progress.pack(fill="x", pady=(8, 2))
-        self.stage_label = ttk.Label(act, text="")
+        self.progress.pack(fill="x", pady=(px(M), px(XS)))
+        self.stage_label = ttk.Label(act, text="", style="Secondary.TLabel")
         self.stage_label.pack(anchor="w")
-        self.file_label = ttk.Label(act, text="", foreground="#555")
+        self.file_label = ttk.Label(act, text="", style="Caption.TLabel")
         self.file_label.pack(anchor="w")
 
-        stats = ttk.LabelFrame(f, text="統計", padding=10)
-        stats.pack(fill="x")
-        self.stats_label = ttk.Label(stats, text="", justify="left")
-        self.stats_label.pack(side="left")
-        ttk.Button(stats, text="前往待核對 →", command=lambda: self.nb.select(self.tab_reviews)).pack(side="right")
+        stats = theme.card(grid)
+        stats.grid(row=1, column=0, sticky="nsew", padx=(0, gap))
+        head = ttk.Frame(stats)
+        head.pack(fill="x")
+        ttk.Label(head, text="狀態", style="Section.TLabel").pack(side="left")
+        ttk.Button(head, text="前往待核對 →", style="Link.TButton",
+                   command=lambda: self.nb.select(self.tab_reviews)).pack(side="right")
+        # 先放底部的統計文字：視窗較矮時被壓縮的是上方的數字區，而不是這行
+        self.stats_label = ttk.Label(stats, text="", style="Caption.TLabel", justify="left")
+        self.stats_label.pack(anchor="w", side="bottom")
+        tiles = ttk.Frame(stats)
+        tiles.pack(fill="both", expand=True, pady=(px(M), 0))
+        tiles.columnconfigure((0, 1), weight=1, uniform="tile")
+        self.metrics: dict[str, tuple[ttk.Label, ttk.Label]] = {}
+        for i, (key, caption) in enumerate((("mappings", "路徑對應已核對"), ("reviews", "待核對"),
+                                            ("instant", "秒傳次數"), ("realtime", "即時同步"))):
+            tile = ttk.Frame(tiles)
+            tile.grid(row=i // 2, column=i % 2, sticky="nw", pady=(0, px(L)))
+            value = ttk.Label(tile, text="—", style="Metric.TLabel")
+            value.pack(anchor="w")
+            cap = ttk.Label(tile, text=caption, style="Caption.TLabel")
+            cap.pack(anchor="w")
+            self.metrics[key] = (value, cap)
 
-        plan = ttk.LabelFrame(f, text="最近一次比對結果", padding=10)
-        plan.pack(fill="both", expand=True, pady=(10, 0))
+        plan = theme.card(grid)
+        plan.grid(row=1, column=1, sticky="nsew")
+        ttk.Label(plan, text="最近一次比對結果", style="Section.TLabel").pack(anchor="w", pady=(0, px(S)))
         self.plan_tree = tree_with_scroll(plan, [
-            ("map", "對應（NAS ⇄ 115）", 330), ("mode", "方向", 90), ("up", "待上傳", 60), ("down", "待下載", 60),
+            ("map", "對應（NAS ⇄ 115）", 260), ("mode", "方向", 70), ("up", "待上傳", 60), ("down", "待下載", 60),
             ("bytes", "傳輸量", 80), ("same", "已相同", 60), ("rev", "待核對", 60), ("only", "僅一邊有", 70),
-            ("del", "刪除", 50), ("warn", "警告", 260)], height=6)
+            ("del", "刪除", 50), ("warn", "警告", 220)], height=6)
         self.plan_tree.frame.pack(fill="both", expand=True)
 
     def _fill_accounts(self) -> None:
@@ -357,20 +431,20 @@ class MainWindow:
 
     def _refresh_account(self) -> None:
         if self.app.demo:
-            self.acct_label.configure(text="示範模式（模擬 115，不會連線）")
+            self.acct_label.configure(text="示範模式（模擬 115，不會連線）", style="Secondary.TLabel")
             return
         cloud = self.cur_cloud
         if not cloud.is_logged_in():
-            self.acct_label.configure(text="尚未登入 115", foreground="#b00000")
+            self.acct_label.configure(text="尚未登入 115", style="Danger.TLabel")
             return
 
         def work():
             try:
                 name = cloud.user_label()
-                self.ui.call(lambda: self.acct_label.configure(text=f"已登入：{name}", foreground="#006000"))
+                self.ui.call(lambda: self.acct_label.configure(text=f"已登入：{name}", style="Success.TLabel"))
             except Exception as e:  # noqa: BLE001
                 msg = f"登入失效：{e}"
-                self.ui.call(lambda: self.acct_label.configure(text=msg, foreground="#b00000"))
+                self.ui.call(lambda: self.acct_label.configure(text=msg, style="Danger.TLabel"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -414,18 +488,25 @@ class MainWindow:
     def _refresh_stats(self) -> None:
         ms = self.config.mappings
         st = self.db.upload_stats()
-        lines = [
-            f"路徑對應：{sum(m.confirmed for m in ms)} / {len(ms)} 已核對",
-            f"待核對：{self.db.count_pending()} 項",
-            f"秒傳：{st.get('instant_n', 0)} 次（省下 {human_size(st.get('instant_bytes', 0))} 流量）　"
-            f"實際上傳：{st.get('real_n', 0)} 次（{human_size(st.get('real_bytes', 0))}）　"
-            f"下載：{st.get('down_n', 0)} 次（其中從 NAS 複製 {st.get('copy_n', 0)} 次）",
-            f"即時同步：{'執行中' if self.rt.running else '未啟動'}"
-            + (f"（待處理 {self.rt.pending_count()} 項）" if self.rt.running else ""),
-        ]
-        self.stats_label.configure(text="\n".join(lines))
         n = self.db.count_pending()
+        running = self.rt.running
+
+        def metric(key, value, caption=None, style="Metric.TLabel"):
+            v, c = self.metrics[key]
+            v.configure(text=value, style=style)
+            if caption is not None:
+                c.configure(text=caption)
+
+        metric("mappings", f"{sum(m.confirmed for m in ms)} / {len(ms)}")
+        metric("reviews", str(n), "待核對" if n else "待核對（全部處理完畢）")
+        metric("instant", str(st.get("instant_n", 0)), f"秒傳次數・省下 {human_size(st.get('instant_bytes', 0))}")
+        metric("realtime", "執行中" if running else "未啟動",
+               f"即時同步・待處理 {self.rt.pending_count()} 項" if running else "即時同步")
+        self.stats_label.configure(
+            text=f"實際上傳 {st.get('real_n', 0)} 次（{human_size(st.get('real_bytes', 0))}）・"
+                 f"下載 {st.get('down_n', 0)} 次（其中從 NAS 複製 {st.get('copy_n', 0)} 次）")
         self.nb.tab(self.tab_reviews, text=f"待核對（{n}）" if n else "待核對")
+        self.sidebar.set_badge(str(self.tab_reviews), str(n) if n else "")
 
     def _show_plans(self, plans) -> None:
         self.plan_tree.delete(*self.plan_tree.get_children())
@@ -505,7 +586,9 @@ class MainWindow:
         self._update_rt_button()
 
     def _update_rt_button(self) -> None:
-        self.rt_btn.configure(text="■ 停止即時同步" if self.rt.running else "▶ 開始即時同步")
+        on = self.rt.running
+        self.rt_btn.configure(text="停止即時同步" if on else "開始即時同步")
+        self.sidebar.set_status("即時同步中" if on else "即時同步未啟動", on)
 
     def _ready_to_sync(self) -> bool:
         ms = self.config.active_mappings()
@@ -523,30 +606,35 @@ class MainWindow:
 
     # ================================================================ 路徑對應
     def _build_mappings(self) -> None:
-        f = self.tab_mappings = self._new_tab("路徑對應")
-        ttk.Label(f, text="只有「已核對」的對應才會比對與同步。新增或自動建議的對應都必須由本人按「核對確認」。",
-                  foreground="#a05000").pack(anchor="w", pady=(0, 6))
-        self.map_tree = tree_with_scroll(f, [("state", "狀態", 90), ("local", "NAS 資料夾", 330),
-                                             ("cloud", "115 資料夾", 250), ("mode", "同步方向", 150),
+        page = self.tab_mappings = self._new_tab(
+            "路徑對應", "只有「已核對」的對應才會比對與同步；新增或自動建議的對應都必須由本人按「核對確認」", "link")
+        f = page.body
+        bar = Flow(f)
+        bar.pack(fill="x", pady=(0, px(M)))
+        buttons = [ttk.Button(bar, text="新增…", style="Accent.TButton", command=self.add_mapping),
+                   ttk.Button(bar, text="自動建議（NAS 所有資料夾）…", command=self.suggest_mappings),
+                   ttk.Button(bar, text="核對確認…", command=self.confirm_mapping),
+                   ttk.Button(bar, text="編輯選項…", command=self.edit_mapping),
+                   ttk.Button(bar, text="取消核對", command=self.unconfirm_mapping),
+                   ttk.Button(bar, text="啟用/停用", command=self.toggle_mapping),
+                   ttk.Button(bar, text="開啟 NAS 資料夾", command=self.open_mapping_local),
+                   ttk.Button(bar, text="在 115 瀏覽器開啟", command=self.open_mapping_cloud),
+                   ttk.Button(bar, text="刪除", style="Destructive.TButton", command=self.remove_mapping)]
+        bar.add(*buttons)
+        self.map_tree = tree_with_scroll(f, [("state", "狀態", 80), ("local", "NAS 資料夾", 300),
+                                             ("cloud", "115 資料夾", 230), ("mode", "同步方向", 140),
                                              ("acct", "帳號", 90), ("type", "類型", 70), ("filter", "篩選", 120),
                                              ("at", "核對時間", 140)], height=16)
         self.map_tree.frame.pack(fill="both", expand=True)
-        bar = ttk.Frame(f)
-        bar.pack(fill="x", pady=8)
-        for text, cmd in (("新增…", self.add_mapping), ("自動建議（NAS 所有資料夾）…", self.suggest_mappings),
-                          ("核對確認…", self.confirm_mapping), ("編輯選項…", self.edit_mapping),
-                          ("取消核對", self.unconfirm_mapping),
-                          ("啟用/停用", self.toggle_mapping), ("刪除", self.remove_mapping),
-                          ("開啟 NAS 資料夾", self.open_mapping_local),
-                          ("在 115 瀏覽器開啟", self.open_mapping_cloud)):
-            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+        self.map_tree.tag_configure("pending", foreground=theme.P.warn_text)
+        self.map_tree.tag_configure("off", foreground=theme.P.text3)
         self.map_tree.bind("<Double-1>", lambda e: self.confirm_mapping())
 
     def _refresh_mappings(self) -> None:
         sel = set(self.map_tree.selection())
         self.map_tree.delete(*self.map_tree.get_children())
         for m in self.config.mappings:
-            state = ("✔ 已核對" if m.confirmed else "✘ 待核對") + ("" if m.enabled else "（停用）")
+            state = ("已核對" if m.confirmed else "待核對") + ("" if m.enabled else "・停用")
             acct = next((a.label for a in self.config.accounts if a.id == m.account_id), m.account_id)
             filt = []
             if m.include_patterns:
@@ -560,7 +648,8 @@ class MainWindow:
             self.map_tree.insert("", "end", iid=m.id, values=(state, m.local_path, m.cloud_path,
                                                               DIRECTION_LABELS.get(m.direction, m.direction), acct,
                                                               "遊戲存檔" if m.savedata else "一般",
-                                                              "；".join(filt), m.confirmed_at))
+                                                              "；".join(filt), m.confirmed_at),
+                                 tags=("off",) if not m.enabled else () if m.confirmed else ("pending",))
         self.map_tree.selection_set([i for i in sel if self.map_tree.exists(i)])
 
     def _selected_mappings(self):
@@ -663,41 +752,50 @@ class MainWindow:
 
     # ================================================================ 待核對
     def _build_reviews(self) -> None:
-        f = self.tab_reviews = self._new_tab("待核對")
-        top = ttk.Frame(f)
-        top.pack(fill="x")
-        ttk.Label(top, text="類型：").pack(side="left")
-        self.kind_filter = ttk.Combobox(top, state="readonly", width=28,
+        page = self.tab_reviews = self._new_tab(
+            "待核對", "同名、相同 MD5/SHA-1、遊戲存檔、衝突與刪除——需要你判斷的項目都在這裡", "flag")
+        f = page.body
+        top = Flow(f)
+        top.pack(fill="x", pady=(0, px(M)))
+        self.kind_filter = ttk.Combobox(top, state="readonly", width=26, style="Popup.TCombobox",
                                         values=["全部"] + [KIND_LABELS[k] for k in DECISIONS])
         self.kind_filter.set("全部")
-        self.kind_filter.pack(side="left")
         self.kind_filter.bind("<<ComboboxSelected>>", lambda e: self._refresh_reviews())
-        ttk.Button(top, text="重新整理", command=self._refresh_reviews).pack(side="left", padx=6)
-        ttk.Button(top, text="全選此類型", command=self._select_all_reviews).pack(side="left")
-        ttk.Label(top, text="可多選同類型項目一次處理", foreground="#555").pack(side="left", padx=10)
+        top.add(self.kind_filter, ttk.Button(top, text="重新整理", command=self._refresh_reviews),
+                ttk.Button(top, text="全選此類型", command=self._select_all_reviews),
+                ttk.Label(top, text="可多選同類型項目一次處理", style="Caption.TLabel"))
 
         pane = ttk.PanedWindow(f, orient="horizontal")
-        pane.pack(fill="both", expand=True, pady=6)
+        pane.pack(fill="both", expand=True)
         left = ttk.Frame(pane)
-        self.rev_tree = tree_with_scroll(left, [("id", "#", 50), ("kind", "類型", 150), ("path", "路徑", 360)],
+        self.rev_tree = tree_with_scroll(left, [("id", "#", 50), ("kind", "類型", 130), ("path", "路徑", 260)],
                                          height=20)
         self.rev_tree.frame.pack(fill="both", expand=True)
         self.rev_tree.bind("<<TreeviewSelect>>", lambda e: self._show_review())
-        pane.add(left, weight=3)
+        pane.add(left, weight=round(MINOR * 1000))
         right = ttk.Frame(pane)
-        self.rev_detail = scrolled_text(right, height=20, wrap="char", state="disabled", font=("Consolas", 10))
+        self.rev_detail = scrolled_text(right, height=20, wrap="char", state="disabled", font="NSBody")
         self.rev_detail.frame.pack(fill="both", expand=True)
         self.proc_frame = ttk.Frame(right)
-        ttk.Label(self.proc_frame, text="遊戲執行檔（選填，逗號分隔，執行中不上傳）：").pack(side="left")
+        ttk.Label(self.proc_frame, text="遊戲執行檔（選填，逗號分隔，執行中不上傳）").pack(anchor="w")
         self.proc_var = tk.StringVar()
-        ttk.Entry(self.proc_frame, textvariable=self.proc_var, width=30).pack(side="left", fill="x", expand=True)
+        ttk.Entry(self.proc_frame, textvariable=self.proc_var).pack(fill="x", pady=(px(XS), 0))
         self.decision_bar = ttk.Frame(right)
-        self.decision_bar.pack(fill="x", pady=(6, 0))
-        nav = ttk.Frame(right)
-        nav.pack(fill="x", pady=(6, 0))
-        ttk.Button(nav, text="開啟 NAS 位置", command=self._open_review_local).pack(side="left")
-        ttk.Button(nav, text="在 115 瀏覽器開啟", command=self._open_review_cloud).pack(side="left", padx=6)
-        pane.add(right, weight=4)
+        self.decision_bar.pack(fill="x", pady=(px(M), 0))
+        nav = Flow(right)
+        nav.pack(fill="x", pady=(px(S), 0))
+        nav.add(ttk.Button(nav, text="開啟 NAS 位置", style="Link.TButton", command=self._open_review_local),
+                ttk.Button(nav, text="在 115 瀏覽器開啟", style="Link.TButton", command=self._open_review_cloud))
+        pane.add(right, weight=round(MAJOR * 1000))
+        self._golden_sash(pane)
+
+    def _golden_sash(self, pane: ttk.PanedWindow) -> None:
+        """第一次顯示時把分隔線放在黃金分割點（左 0.382、右 0.618）。"""
+        def place(event=None):
+            if pane.winfo_width() > 1:
+                pane.sashpos(0, round(pane.winfo_width() * MINOR))
+                pane.unbind("<Map>")
+        pane.bind("<Map>", place)
 
     def _refresh_reviews(self) -> None:
         label = self.kind_filter.get()
@@ -736,10 +834,12 @@ class MainWindow:
         if not sel:
             set_text(self.rev_detail, "請在左側選取一個待核對項目。")
             return
-        set_text(self.rev_detail, review_text(sel[0]) + (f"\n\n（共選取 {len(sel)} 項）" if len(sel) > 1 else ""))
+        show_review_text(self.rev_detail,
+                         review_text(sel[0]) + (f"\n\n（共選取 {len(sel)} 項）" if len(sel) > 1 else ""))
         kinds = {rv.kind for rv in sel}
         if len(kinds) != 1:
-            ttk.Label(self.decision_bar, text="選取了不同類型的項目，請只選同一類型以一次處理。").pack(anchor="w")
+            ttk.Label(self.decision_bar, text="選取了不同類型的項目，請只選同一類型以一次處理。",
+                      style="Warning.TLabel").pack(anchor="w")
             return
         kind = kinds.pop()
         opts = available_decisions(kind, sel[0].details)
@@ -747,10 +847,12 @@ class MainWindow:
             common = set.intersection(*[{d for d, _ in available_decisions(rv.kind, rv.details)} for rv in sel])
             opts = [o for o in opts if o[0] in common]
         if kind == SAVEDATA_GROUP:
-            self.proc_frame.pack(fill="x", pady=(6, 0), before=self.decision_bar)
+            self.proc_frame.pack(fill="x", pady=(px(M), 0), before=self.decision_bar)
         for i, (decision, label) in enumerate(opts):
-            ttk.Button(self.decision_bar, text=label, command=lambda d=decision, lb=label: self._decide(d, lb)).grid(
-                row=i // 2, column=i % 2, sticky="we", padx=(0, 6), pady=2)
+            style = "Destructive.TButton" if decision in DANGEROUS else "Accent.TButton" if i == 0 else "TButton"
+            ttk.Button(self.decision_bar, text=label, style=style,
+                       command=lambda d=decision, lb=label: self._decide(d, lb)).grid(
+                row=i // 2, column=i % 2, sticky="we", padx=(0, px(S)), pady=(0, px(S)))
         for c in range(2):
             self.decision_bar.columnconfigure(c, weight=1, uniform="decision")
 
@@ -816,22 +918,21 @@ class MainWindow:
 
     # ================================================================ 遊戲存檔
     def _build_savedata(self) -> None:
-        f = self.tab_savedata = self._new_tab("遊戲存檔")
-        ttk.Label(f, text="核可後的存檔資料夾會像 Steam 雲存檔一樣：遊戲寫完存檔（靜置一段時間、遊戲程序結束）後，"
-                          "自動上傳到 115 對應資料夾並刪除 115 上的舊版。", wraplength=1100,
-                  foreground="#555").pack(anchor="w", pady=(0, 6))
-        self.save_tree = tree_with_scroll(f, [("map", "對應", 260), ("dir", "存檔資料夾", 330), ("state", "狀態", 190),
+        page = self.tab_savedata = self._new_tab(
+            "遊戲存檔", "像 Steam 雲存檔：遊戲寫完存檔、程序結束後自動上傳到 115，並刪除 115 上的舊版", "game")
+        f = page.body
+        bar = Flow(f)
+        bar.pack(fill="x", pady=(0, px(M)))
+        bar.add(ttk.Button(bar, text="核可自動同步", style="Accent.TButton",
+                           command=lambda: self._group_action("approve")),
+                ttk.Button(bar, text="立即同步此存檔", command=self._sync_group_now),
+                ttk.Button(bar, text="設定遊戲程序…", command=self._set_group_procs),
+                ttk.Button(bar, text="當一般檔案", command=lambda: self._group_action("normal")),
+                ttk.Button(bar, text="不同步", command=lambda: self._group_action("exclude")),
+                ttk.Button(bar, text="開啟 NAS 位置", style="Link.TButton", command=self._open_group_local))
+        self.save_tree = tree_with_scroll(f, [("map", "對應", 220), ("dir", "存檔資料夾", 300), ("state", "狀態", 190),
                                               ("proc", "遊戲程序", 160), ("last", "上次上傳", 150)], height=16)
         self.save_tree.frame.pack(fill="both", expand=True)
-        bar = ttk.Frame(f)
-        bar.pack(fill="x", pady=8)
-        for text, cmd in (("核可自動同步", lambda: self._group_action("approve")),
-                          ("當一般檔案", lambda: self._group_action("normal")),
-                          ("不同步", lambda: self._group_action("exclude")),
-                          ("設定遊戲程序…", self._set_group_procs),
-                          ("立即同步此存檔", self._sync_group_now),
-                          ("開啟 NAS 位置", self._open_group_local)):
-            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
 
     def _refresh_savedata(self) -> None:
         self.save_tree.delete(*self.save_tree.get_children())
@@ -888,29 +989,32 @@ class MainWindow:
 
     # ================================================================ 紀錄
     def _build_log(self) -> None:
-        f = self.tab_log = self._new_tab("紀錄")
+        page = self.tab_log = self._new_tab("紀錄", "執行紀錄與每一次上傳、下載、刪除的同步歷史", "history")
+        f = page.body
         pane = ttk.PanedWindow(f, orient="vertical")
         pane.pack(fill="both", expand=True)
         top = ttk.Frame(pane)
-        self.log_text = scrolled_text(top, height=12, state="disabled", font=("Consolas", 9))
+        self.log_text = scrolled_text(top, height=12, state="disabled", font="NSMono")
         self.log_text.frame.pack(fill="both", expand=True)
-        self.log_text.tag_configure("warn", foreground="#a05000")
-        self.log_text.tag_configure("error", foreground="#b00000")
+        self.log_text.tag_configure("warn", foreground=theme.P.warn_text)
+        self.log_text.tag_configure("error", foreground=theme.P.danger_text)
         pane.add(top, weight=1)
         bottom = ttk.Frame(pane)
         bar = ttk.Frame(bottom)
-        bar.pack(fill="x")
-        ttk.Label(bar, text="同步歷史").pack(side="left")
-        ttk.Button(bar, text="重新整理", command=self._refresh_history).pack(side="left", padx=6)
-        self.hist_tree = tree_with_scroll(bottom, [("ts", "時間", 150), ("action", "動作", 130), ("path", "路徑", 420),
+        bar.pack(fill="x", pady=(px(S), px(S)))
+        ttk.Label(bar, text="同步歷史", style="Section.TLabel").pack(side="left")
+        ttk.Button(bar, text="重新整理", command=self._refresh_history).pack(side="right")
+        self.hist_tree = tree_with_scroll(bottom, [("ts", "時間", 150), ("action", "動作", 120), ("path", "路徑", 380),
                                                    ("how", "方式", 90), ("size", "大小", 90), ("ok", "結果", 60),
                                                    ("detail", "說明", 250)], height=10)
         self.hist_tree.frame.pack(fill="both", expand=True)
+        self.hist_tree.tag_configure("fail", foreground=theme.P.danger_text)
         pane.add(bottom, weight=1)
         self.nb.bind("<<NotebookTabChanged>>", lambda e: self._on_tab())
 
     def _on_tab(self) -> None:
         cur = self.nb.select()
+        self.sidebar.select(cur)
         if cur == str(self.tab_log):
             self._refresh_history()
         elif cur == str(self.tab_savedata):
@@ -934,17 +1038,20 @@ class MainWindow:
             how = ("秒傳" if h["instant"] else "實際上傳") if str(h["action"]).startswith("upload") else ""
             self.hist_tree.insert("", "end", values=(fmt_time(h["ts"]), h["action"], h["rel_path"], how,
                                                      human_size(h["size"]) if h["size"] else "",
-                                                     "成功" if h["ok"] else "失敗", h["detail"] or ""))
+                                                     "成功" if h["ok"] else "失敗", h["detail"] or ""),
+                                  tags=() if h["ok"] else ("fail",))
 
     # ================================================================ 設定
     def _build_settings(self) -> None:
-        outer = self.tab_settings = ttk.Frame(self.nb)
-        self.nb.add(outer, text="設定")
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        f = ttk.Frame(canvas, padding=12)
+        page = self.tab_settings = self._new_tab("設定", "同步規則、即時同步、遊戲存檔、傳輸與外觀", "settings",
+                                                 card=False)
+        p = theme.P
+        canvas = tk.Canvas(page, highlightthickness=0, background=p.bg, borderwidth=0)
+        sb = AutoScrollbar(page, orient="vertical", command=canvas.yview, style="Page.Vertical.TScrollbar")
+        f = ttk.Frame(canvas, style="Page.TFrame")
         f.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=f, anchor="nw")
+        win = canvas.create_window((0, 0), window=f, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -952,68 +1059,87 @@ class MainWindow:
                         if self.nb.select() == str(self.tab_settings) else None)
 
         s = self.config.settings
+        specs = {spec[0]: spec for spec in SETTING_FIELDS}
         self.settings_vars: dict[str, object] = {}
-        for row, spec in enumerate(SETTING_FIELDS):
-            name, label, typ = spec[0], spec[1], spec[2]
-            val = getattr(s, name)
-            if typ == "bool":
-                var = tk.BooleanVar(value=bool(val))
-                ttk.Checkbutton(f, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
-            elif typ == "lines":
-                ttk.Label(f, text=label).grid(row=row, column=0, sticky="nw", pady=3)
-                var = tk.Text(f, height=8, width=50)
-                var.insert("1.0", "\n".join(val))
-                var.grid(row=row, column=1, sticky="we", pady=3)
-            elif typ == "choice":
-                ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=3)
-                choices = spec[3]
-                var = tk.StringVar(value=dict(choices).get(val, val))
-                cb = ttk.Combobox(f, textvariable=var, values=[c[1] for c in choices], state="readonly", width=40)
-                cb.grid(row=row, column=1, sticky="w", pady=3)
-            else:
-                ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=3)
-                text = ", ".join(val) if typ == "list" else str(val)
-                var = tk.StringVar(value=text)
-                ttk.Entry(f, textvariable=var, width=60 if typ in ("str", "list") else 12).grid(
-                    row=row, column=1, sticky="w", pady=3)
-            self.settings_vars[name] = var
-        row = len(SETTING_FIELDS)
+        for title, names in SETTING_GROUPS:
+            ttk.Label(f, text=title, style="PageSection.TLabel").pack(anchor="w", pady=(px(M), px(XS)),
+                                                                      padx=(px(S), 0))
+            box = theme.card(f, padding=M)
+            box.pack(fill="x", padx=(0, px(M)))
+            # 黃金分割：說明欄 : 設定欄 = 1 : φ
+            box.columnconfigure(0, weight=round(MINOR * 1000), uniform="set")
+            box.columnconfigure(1, weight=round(MAJOR * 1000), uniform="set")
+            for row, name in enumerate(names):
+                spec = specs[name]
+                label, typ = spec[1], spec[2]
+                val = getattr(s, name)
+                pad = (px(XS), px(XS))
+                if row:
+                    theme.separator(box).grid(row=2 * row - 1, column=0, columnspan=2, sticky="we", pady=px(XXS))
+                r = 2 * row
+                if typ == "bool":
+                    var = tk.BooleanVar(value=bool(val))
+                    ttk.Checkbutton(box, text=label, variable=var).grid(row=r, column=0, columnspan=2, sticky="w",
+                                                                        pady=pad)
+                else:
+                    wrap_label(box, label, style="TLabel").grid(row=r, column=0, sticky="we", pady=pad,
+                                                                 padx=(0, px(M)))
+                    if typ == "lines":
+                        var = tk.Text(box, height=6, width=40, font="NSMono", background=p.bg,
+                                      padx=px(S), pady=px(S))
+                        var.insert("1.0", "\n".join(val))
+                        var.grid(row=r, column=1, sticky="we", pady=pad)
+                    elif typ == "choice":
+                        choices = spec[3]
+                        var = tk.StringVar(value=dict(choices).get(val, val))
+                        ttk.Combobox(box, textvariable=var, values=[c[1] for c in choices], state="readonly",
+                                     style="Popup.TCombobox").grid(row=r, column=1, sticky="we", pady=pad)
+                    else:
+                        var = tk.StringVar(value=", ".join(val) if typ == "list" else str(val))
+                        ttk.Entry(box, textvariable=var, width=40 if typ in ("str", "list") else 10).grid(
+                            row=r, column=1, sticky="we" if typ in ("str", "list") else "w", pady=pad)
+                self.settings_vars[name] = var
+
+        ttk.Label(f, text="Windows", style="PageSection.TLabel").pack(anchor="w", pady=(px(M), px(XS)),
+                                                                      padx=(px(S), 0))
+        box = theme.card(f, padding=M)
+        box.pack(fill="x", padx=(0, px(M)))
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
-        ttk.Checkbutton(f, text="Windows 開機時自動啟動並開始即時同步", variable=self.autostart_var,
-                        state="normal" if autostart.supported() else "disabled").grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(12, 3))
-        bar = ttk.Frame(f)
-        bar.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=10)
-        ttk.Button(bar, text="儲存設定", style="Big.TButton", command=self.save_settings).pack(side="left")
-        ttk.Button(bar, text="選擇 115 瀏覽器…", command=self._pick_browser).pack(side="left", padx=6)
-        ttk.Label(f, text="API 間隔、分片大小、代理在重新啟動程式後生效；即時同步相關設定在重新開始即時同步後生效。",
-                  foreground="#555").grid(row=row + 2, column=0, columnspan=2, sticky="w")
-        self._build_schedules(f, row + 3)
-        f.columnconfigure(1, weight=1)
+        ttk.Checkbutton(box, text="Windows 開機時自動啟動並開始即時同步", variable=self.autostart_var,
+                        state="normal" if autostart.supported() else "disabled").pack(anchor="w")
+        bar = Flow(f, style="Page.TFrame")
+        bar.pack(fill="x", pady=(px(L), px(XS)), padx=(px(S), 0))
+        bar.add(ttk.Button(bar, text="儲存設定", style="Large.Accent.TButton", command=self.save_settings),
+                ttk.Button(bar, text="選擇 115 瀏覽器…", style="Large.TButton", command=self._pick_browser))
+        wrap_label(f, "API 間隔、分片大小、代理與外觀在重新啟動程式後生效；即時同步相關設定在重新開始即時同步後生效。",
+                   style="Status.TLabel").pack(fill="x", padx=(px(S), px(M)))
+        self._build_schedules(f)
 
     # ================================================================ 排程
-    def _build_schedules(self, parent, row: int) -> None:
-        box = ttk.LabelFrame(parent, text="排程（在指定時間自動完整比對／同步；需本程式在執行中）", padding=8)
-        box.grid(row=row, column=0, columnspan=2, sticky="we", pady=(12, 0))
+    def _build_schedules(self, parent) -> None:
+        ttk.Label(parent, text="排程（在指定時間自動完整比對／同步；需本程式在執行中）", style="PageSection.TLabel").pack(
+            anchor="w", pady=(px(L), px(XS)), padx=(px(S), 0))
+        box = theme.card(parent, padding=M)
+        box.pack(fill="x", padx=(0, px(M)), pady=(0, px(XL)))
         self.sched_tree = tree_with_scroll(box, [("desc", "排程", 520)], height=4, selectmode="browse")
         self.sched_tree.frame.pack(fill="x")
-        bar = ttk.Frame(box)
-        bar.pack(fill="x", pady=(6, 0))
-        ttk.Label(bar, text="時間").pack(side="left")
+        bar = Flow(box)
+        bar.pack(fill="x", pady=(px(M), 0))
         self.sched_time = tk.StringVar(value="03:00")
-        ttk.Entry(bar, textvariable=self.sched_time, width=6).pack(side="left", padx=(2, 8))
+        items = [ttk.Label(bar, text="時間"), ttk.Entry(bar, textvariable=self.sched_time, width=6)]
         self.sched_days = []
         for d in WEEKDAYS:
             v = tk.BooleanVar(value=True)
-            ttk.Checkbutton(bar, text=d, variable=v).pack(side="left")
+            items.append(ttk.Checkbutton(bar, text=d, variable=v))
             self.sched_days.append(v)
-        self.sched_action = ttk.Combobox(bar, state="readonly", width=14, values=["完整比對＋同步", "只比對"])
+        self.sched_action = ttk.Combobox(bar, state="readonly", width=14, values=["完整比對＋同步", "只比對"],
+                                         style="Popup.TCombobox")
         self.sched_action.set("完整比對＋同步")
-        self.sched_action.pack(side="left", padx=8)
-        ttk.Button(bar, text="新增", command=self._add_schedule).pack(side="left")
-        ttk.Button(bar, text="刪除", command=self._del_schedule).pack(side="left", padx=4)
-        ttk.Button(bar, text="啟用/停用", command=self._toggle_schedule).pack(side="left")
-        ttk.Button(bar, text="立即執行", command=self._run_schedule_now).pack(side="left", padx=4)
+        items += [self.sched_action, ttk.Button(bar, text="新增", style="Accent.TButton", command=self._add_schedule),
+                  ttk.Button(bar, text="啟用/停用", command=self._toggle_schedule),
+                  ttk.Button(bar, text="立即執行", command=self._run_schedule_now),
+                  ttk.Button(bar, text="刪除", style="Destructive.TButton", command=self._del_schedule)]
+        bar.add(*items)
         self._refresh_schedules()
 
     def _refresh_schedules(self) -> None:
@@ -1115,7 +1241,7 @@ class MainWindow:
 
 def review_text(rv) -> str:
     d = rv.details
-    out = [f"[{KIND_LABELS.get(rv.kind, rv.kind)}]  #{rv.id}", d.get("message", ""), ""]
+    out = [f"{KIND_LABELS.get(rv.kind, rv.kind)}　#{rv.id}", d.get("message", ""), ""]
     out.append(f"NAS 根目錄：{d.get('local_root', '')}")
     out.append(f"115 根目錄：{d.get('cloud_root', '')}")
     out.append(f"同步方向：{DIRECTION_LABELS.get(d.get('direction', 'upload'), '')}")
@@ -1127,7 +1253,7 @@ def review_text(rv) -> str:
         if loc.get("mtime"):
             out.append(f"  修改時間：{fmt_time(loc['mtime'])}")
         if loc.get("md5"):
-            out.append(f"  MD5  ：{loc['md5']}")
+            out.append(f"  MD5：{loc['md5']}")
         if loc.get("sha1"):
             out.append(f"  SHA-1：{loc['sha1']}")
     for c in d.get("cloud") or []:
@@ -1163,6 +1289,29 @@ def review_text(rv) -> str:
             out.append(f"  …其餘 {len(d['paths']) - 100} 個")
     out += ["", "說明：SHA-1 相同即內容相同。115 只提供 SHA-1；MD5 由本程式在 NAS 端計算並記錄。"]
     return "\n".join(out)
+
+
+def show_review_text(widget: tk.Text, content: str) -> None:
+    """排版待核對說明：第一行是標題、「■」開頭是粗體小節標題、MD5／SHA-1 用等寬字型、補充說明用次要文字色。"""
+    widget.configure(state="normal")
+    widget.delete("1.0", "end")
+    widget.tag_configure("title", font="NSHeadline", spacing3=px(XS))
+    widget.tag_configure("section", font="NSBodyBold", spacing1=px(S), spacing3=px(XXS))
+    widget.tag_configure("mono", font="NSMono")
+    widget.tag_configure("note", foreground=theme.P.text2)
+    for i, line in enumerate(content.split("\n")):
+        tags: tuple[str, ...] = ()
+        if i == 0:
+            tags = ("title",)
+        elif line.startswith("■ "):
+            line, tags = line[2:], ("section",)
+        elif line.startswith(("說明：", "→ ", "核可後：", "（共選取")):
+            tags = ("note",)
+        start = widget.index("end-1c")
+        widget.insert("end", line + "\n", tags)
+        for m in re.finditer(r"\b[0-9A-Fa-f]{32}(?:[0-9A-Fa-f]{8})?\b", line):
+            widget.tag_add("mono", f"{start}+{m.start()}c", f"{start}+{m.end()}c")
+    widget.configure(state="disabled")
 
 
 def apply_window_icon(root: tk.Tk) -> None:

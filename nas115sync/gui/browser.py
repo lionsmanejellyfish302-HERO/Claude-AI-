@@ -1,4 +1,4 @@
-"""雙窗格瀏覽器（類似 Air Explorer）：左邊 NAS、右邊 115，可上傳、下載、新增資料夾、改名、刪除、搬移、搜尋、比較。"""
+"""雙窗格瀏覽器（Finder 風格）：左邊 NAS、右邊 115，可上傳、下載、新增資料夾、改名、刪除、搬移、搜尋、比較。"""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,9 @@ from .. import manual
 from ..app import open_in_115_browser
 from ..cloud.base import CloudEntry
 from ..paths import cloud_norm, name_key, unsafe_name
-from .util import fmt_time, human_size, open_local, tree_with_scroll
+from . import theme
+from .theme import XS, M, S, px
+from .util import Flow, fmt_time, human_size, open_local, tree_with_scroll
 
 STATUS = {"same": "＝ 相同", "different": "≠ 不同", "nas_only": "只在 NAS", "cloud_only": "只在 115"}
 CONFLICT_CHOICES = [(manual.KEEP_BOTH, "保留兩者（新檔加時間戳記）"), (manual.OVERWRITE, "覆蓋（舊檔可復原）"),
@@ -26,43 +28,62 @@ class BrowserTab:
         self.cloud_items: dict[str, CloudEntry] = {}
         self.compare: dict[str, str] = {}
 
-        top = ttk.Frame(parent)
-        top.pack(fill="x")
-        ttk.Button(top, text="⇄ 比較兩邊（MD5/SHA-1）", command=self.compare_sides).pack(side="left")
-        ttk.Label(top, text="  同名但內容不同時：").pack(side="left")
-        self.conflict = ttk.Combobox(top, state="readonly", width=24, values=[c[1] for c in CONFLICT_CHOICES])
+        self.icon_dir, self.icon_file = theme.folder_icon(px(16)), theme.file_icon(px(16))
+        top = Flow(parent)
+        top.pack(fill="x", pady=(0, px(M)))
+        self.conflict = ttk.Combobox(top, state="readonly", width=24, values=[c[1] for c in CONFLICT_CHOICES],
+                                     style="Popup.TCombobox")
         self.conflict.set(CONFLICT_CHOICES[0][1])
-        self.conflict.pack(side="left")
-        ttk.Label(top, text="  上傳一律先嘗試秒傳；下載會先找 NAS 上相同內容的檔案直接複製，並驗證 SHA-1。",
-                  foreground="#555").pack(side="left")
+        top.add(ttk.Button(top, text="比較兩邊（MD5/SHA-1）", style="Accent.TButton", command=self.compare_sides),
+                ttk.Label(top, text="同名但內容不同時"), self.conflict,
+                ttk.Label(top, text="上傳一律先嘗試秒傳；下載先找 NAS 上相同內容的檔案直接複製，並驗證 SHA-1。",
+                          style="Caption.TLabel"))
 
         pane = ttk.PanedWindow(parent, orient="horizontal")
-        pane.pack(fill="both", expand=True, pady=6)
+        pane.pack(fill="both", expand=True)
         pane.add(self._build_local(pane), weight=1)
         pane.add(self._build_cloud(pane), weight=1)
 
     # ================================================================ NAS 窗格
-    def _build_local(self, pane) -> ttk.Frame:
-        f = ttk.LabelFrame(pane, text="NAS / 本機", padding=6)
+    @staticmethod
+    def _pane_head(f, title: str) -> ttk.Frame:
+        """兩個窗格的標題列等高，下面的路徑列與清單才會左右對齊。"""
+        head = ttk.Frame(f, height=px(44))
+        head.pack(fill="x", pady=(0, px(S)))
+        head.pack_propagate(False)
+        ttk.Label(head, text=title, style="Section.TLabel").pack(side="left")
+        return head
+
+    @staticmethod
+    def _path_bar(f, up, var: tk.StringVar, go, refresh) -> None:
         bar = ttk.Frame(f)
         bar.pack(fill="x")
-        ttk.Button(bar, text="↑", width=3, command=self.local_up).pack(side="left")
+        ttk.Button(bar, text=theme.icon("up"), style="Icon.TButton", command=up).pack(side="left")
+        e = ttk.Entry(bar, textvariable=var)
+        e.pack(side="left", fill="x", expand=True, padx=px(S))
+        e.bind("<Return>", lambda ev: go(var.get()))
+        ttk.Button(bar, text=theme.icon("refresh"), style="Icon.TButton", command=refresh).pack(side="left")
+
+    def _build_local(self, pane) -> ttk.Frame:
+        f = ttk.Frame(pane, padding=(0, 0, px(M), 0))
+        head = self._pane_head(f, "NAS／本機")
+        ttk.Button(head, text="瀏覽…", command=self.local_pick).pack(side="right")
         self.local_var = tk.StringVar()
-        e = ttk.Entry(bar, textvariable=self.local_var)
-        e.pack(side="left", fill="x", expand=True, padx=4)
-        e.bind("<Return>", lambda ev: self.local_go(self.local_var.get()))
-        ttk.Button(bar, text="瀏覽…", command=self.local_pick).pack(side="left")
-        ttk.Button(bar, text="⟳", width=3, command=lambda: self.local_go(self.local_dir)).pack(side="left", padx=(4, 0))
-        self.local_tree = tree_with_scroll(f, [("name", "名稱", 200), ("size", "大小", 70), ("mtime", "修改時間", 130),
-                                               ("cmp", "比較", 70)], height=18)
-        self.local_tree.frame.pack(fill="both", expand=True, pady=4)
+        self._path_bar(f, self.local_up, self.local_var, self.local_go, lambda: self.local_go(self.local_dir))
+        self.local_status = ttk.Label(f, text="", style="Caption.TLabel")  # 與 Finder 底部的狀態列相同
+        self.local_status.pack(side="bottom", anchor="w")
+        ops = Flow(f)
+        ops.pack(side="bottom", fill="x")  # 先放底部：視窗再矮，操作按鈕也不會被清單擠掉
+        self.local_tree = tree_with_scroll(f, [("size", "大小", 70), ("mtime", "修改時間", 130), ("cmp", "比較", 70)],
+                                           height=8, icon_col=("名稱", 220))
+        self.local_tree.frame.pack(fill="both", expand=True, pady=px(S))
         self.local_tree.bind("<Double-1>", self._local_open)
-        ops = ttk.Frame(f)
-        ops.pack(fill="x")
-        for text, cmd in (("上傳選取 →", self.upload_selected), ("新資料夾", self.local_mkdir),
-                          ("重新命名", self.local_rename), ("刪除（資源回收筒）", self.local_delete),
-                          ("在檔案總管開啟", lambda: open_local(self.local_dir) if self.local_dir else None)):
-            ttk.Button(ops, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        ops.add(ttk.Button(ops, text="上傳到 115", style="Accent.TButton", command=self.upload_selected),
+                ttk.Button(ops, text="新資料夾", command=self.local_mkdir),
+                ttk.Button(ops, text="重新命名", command=self.local_rename),
+                ttk.Button(ops, text="刪除（資源回收筒）", style="Destructive.TButton", command=self.local_delete),
+                ttk.Button(ops, text="在檔案總管開啟", style="Link.TButton",
+                           command=lambda: open_local(self.local_dir) if self.local_dir else None))
         return f
 
     def set_initial_local(self, path: str) -> None:
@@ -105,9 +126,9 @@ class BrowserTab:
                 is_dir = e.is_dir()
             except OSError:
                 continue
-            t.insert("", "end", iid=e.name, values=(("📁 " if is_dir else "") + e.name,
-                                                     "" if is_dir else human_size(st.st_size),
-                                                     fmt_time(st.st_mtime), ""))
+            t.insert("", "end", iid=e.name, text=" " + e.name, image=self.icon_dir if is_dir else self.icon_file,
+                     values=("" if is_dir else human_size(st.st_size), fmt_time(st.st_mtime), ""))
+        self.local_status.configure(text=f"{len(t.get_children())} 個項目")
 
     def _local_open(self, _event=None) -> None:
         sel = self.local_tree.selection()
@@ -167,38 +188,34 @@ class BrowserTab:
 
     # ================================================================ 115 窗格
     def _build_cloud(self, pane) -> ttk.Frame:
-        f = ttk.LabelFrame(pane, text="115 網盤", padding=6)
-        bar = ttk.Frame(f)
-        bar.pack(fill="x")
-        ttk.Label(bar, text="帳號：").pack(side="left")
-        self.account = ttk.Combobox(bar, state="readonly", width=14)
-        self.account.pack(side="left")
+        f = ttk.Frame(pane, padding=(px(M), 0, 0, 0))
+        head = self._pane_head(f, "115 網盤")
+        self.account = ttk.Combobox(head, state="readonly", width=12, style="Popup.TCombobox")
+        self.account.pack(side="right")
         self.account.bind("<<ComboboxSelected>>", lambda e: self.cloud_go_path("/"))
-        ttk.Button(bar, text="↑", width=3, command=self.cloud_up).pack(side="left", padx=(6, 0))
-        self.cloud_var = tk.StringVar(value="/")
-        e = ttk.Entry(bar, textvariable=self.cloud_var)
-        e.pack(side="left", fill="x", expand=True, padx=4)
-        e.bind("<Return>", lambda ev: self.cloud_go_path(self.cloud_var.get()))
-        ttk.Button(bar, text="⟳", width=3, command=self.cloud_refresh).pack(side="left")
-        sbar = ttk.Frame(f)
-        sbar.pack(fill="x", pady=(4, 0))
+        # 搜尋欄放在標題列（與 Finder 工具列右上角的搜尋欄相同位置）
+        ttk.Button(head, text=theme.icon("search"), style="Icon.TButton", command=self.cloud_search).pack(
+            side="right", padx=(px(XS), px(S)))
         self.search_var = tk.StringVar()
-        se = ttk.Entry(sbar, textvariable=self.search_var)
-        se.pack(side="left", fill="x", expand=True)
+        se = ttk.Entry(head, textvariable=self.search_var, width=10)
+        se.pack(side="right", fill="x", expand=True, padx=(px(M), 0))
         se.bind("<Return>", lambda ev: self.cloud_search())
-        ttk.Button(sbar, text="🔍 在此資料夾搜尋", command=self.cloud_search).pack(side="left", padx=(4, 0))
-        self.cloud_tree = tree_with_scroll(f, [("name", "名稱", 200), ("size", "大小", 70), ("mtime", "上傳時間", 130),
-                                               ("sha1", "SHA-1", 100), ("cmp", "比較", 70)], height=16)
-        self.cloud_tree.frame.pack(fill="both", expand=True, pady=4)
+        self.cloud_var = tk.StringVar(value="/")
+        self._path_bar(f, self.cloud_up, self.cloud_var, self.cloud_go_path, self.cloud_refresh)
+        self.cloud_status = ttk.Label(f, text="", style="Caption.TLabel")
+        self.cloud_status.pack(side="bottom", anchor="w")
+        ops = Flow(f)
+        ops.pack(side="bottom", fill="x")
+        self.cloud_tree = tree_with_scroll(f, [("size", "大小", 70), ("mtime", "上傳時間", 130), ("sha1", "SHA-1", 100),
+                                               ("cmp", "比較", 70)], height=8, icon_col=("名稱", 220))
+        self.cloud_tree.frame.pack(fill="both", expand=True, pady=px(S))
         self.cloud_tree.bind("<Double-1>", self._cloud_open)
-        ops = ttk.Frame(f)
-        ops.pack(fill="x")
-        for text, cmd in (("← 下載選取", self.download_selected), ("新資料夾", self.cloud_mkdir),
-                          ("重新命名", self.cloud_rename), ("刪除（進 115 回收站）", self.cloud_delete),
-                          ("移動到…", self.cloud_move), ("在 115 瀏覽器開啟", self.cloud_open_browser)):
-            ttk.Button(ops, text=text, command=cmd).pack(side="left", padx=(0, 4))
-        self.cloud_status = ttk.Label(f, text="", foreground="#555")
-        self.cloud_status.pack(anchor="w")
+        ops.add(ttk.Button(ops, text="下載到 NAS", style="Accent.TButton", command=self.download_selected),
+                ttk.Button(ops, text="新資料夾", command=self.cloud_mkdir),
+                ttk.Button(ops, text="重新命名", command=self.cloud_rename),
+                ttk.Button(ops, text="移動到…", command=self.cloud_move),
+                ttk.Button(ops, text="刪除（進 115 回收站）", style="Destructive.TButton", command=self.cloud_delete),
+                ttk.Button(ops, text="在 115 瀏覽器開啟", style="Link.TButton", command=self.cloud_open_browser))
         return f
 
     def refresh_accounts(self) -> None:
@@ -276,9 +293,9 @@ class BrowserTab:
         for e in sorted(entries, key=lambda x: (not x.is_dir, name_key(x.name))):
             iid = e.fid
             self.cloud_items[iid] = e
-            t.insert("", "end", iid=iid, values=(("📁 " if e.is_dir else "") + e.name,
-                                                  "" if e.is_dir else human_size(e.size),
-                                                  fmt_time(e.mtime), e.sha1[:12], ""))
+            t.insert("", "end", iid=iid, text=" " + e.name, image=self.icon_dir if e.is_dir else self.icon_file,
+                     values=("" if e.is_dir else human_size(e.size), fmt_time(e.mtime), e.sha1[:12], ""))
+        self.cloud_status.configure(text=f"{len(self.cloud_items)} 個項目")
 
     def _cloud_open(self, _event=None) -> None:
         sel = self.cloud_tree.selection()

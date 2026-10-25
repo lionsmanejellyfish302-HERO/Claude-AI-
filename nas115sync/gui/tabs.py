@@ -5,7 +5,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .. import manual
-from .util import human_size, open_local, tree_with_scroll
+from . import theme
+from .theme import S, px
+from .util import AutoScrollbar, Flow, human_size, open_local, tree_with_scroll
 
 STATUS_LABELS = {"queued": "排隊中", "running": "傳輸中", "paused": "已暫停", "done": "完成", "failed": "失敗",
                  "cancelled": "已取消", "skipped": "略過"}
@@ -17,28 +19,26 @@ class TransfersTab:
     def __init__(self, win, parent: ttk.Frame):
         self.win = win
         self.mgr = win.engine.transfers
-        top = ttk.Frame(parent)
-        top.pack(fill="x")
-        self.pause_btn = ttk.Button(top, text="⏸ 全部暫停", command=self.toggle_pause)
-        self.pause_btn.pack(side="left")
-        ttk.Button(top, text="✖ 取消選取的傳輸", command=self.cancel_selected).pack(side="left", padx=6)
-        ttk.Button(top, text="清除已完成", command=self.clear).pack(side="left")
+        top = Flow(parent)
+        top.pack(fill="x", pady=(0, px(S)))
         s = win.config.settings
-        ttk.Label(top, text="   上傳限速 KB/s：").pack(side="left")
+        self.pause_btn = ttk.Button(top, text="全部暫停", command=self.toggle_pause)
         self.up_var = tk.StringVar(value=str(s.upload_limit_kb))
-        ttk.Entry(top, textvariable=self.up_var, width=8).pack(side="left")
-        ttk.Label(top, text=" 下載限速 KB/s：").pack(side="left")
         self.down_var = tk.StringVar(value=str(s.download_limit_kb))
-        ttk.Entry(top, textvariable=self.down_var, width=8).pack(side="left")
-        ttk.Button(top, text="套用（0 = 不限）", command=self.apply_limits).pack(side="left", padx=6)
-        self.summary = ttk.Label(parent, text="", foreground="#555")
-        self.summary.pack(anchor="w", pady=4)
+        top.add(self.pause_btn,
+                ttk.Button(top, text="取消選取的傳輸", style="Destructive.TButton", command=self.cancel_selected),
+                ttk.Button(top, text="清除已完成", command=self.clear),
+                ttk.Label(top, text="上傳限速 KB/s"), ttk.Entry(top, textvariable=self.up_var, width=8),
+                ttk.Label(top, text="下載限速 KB/s"), ttk.Entry(top, textvariable=self.down_var, width=8),
+                ttk.Button(top, text="套用（0 = 不限）", command=self.apply_limits))
+        self.summary = ttk.Label(parent, text="", style="Secondary.TLabel")
+        self.summary.pack(anchor="w", pady=(0, px(S)))
         self.tree = tree_with_scroll(parent, [("id", "#", 50), ("kind", "方向", 70), ("path", "檔案", 420),
                                               ("size", "大小", 90), ("pct", "進度", 70), ("speed", "速度", 90),
                                               ("status", "狀態", 110), ("err", "說明", 260)], height=22)
         self.tree.frame.pack(fill="both", expand=True)
-        self.tree.tag_configure("failed", foreground="#b00000")
-        self.tree.tag_configure("instant", foreground="#006000")
+        self.tree.tag_configure("failed", foreground=theme.P.danger_text)
+        self.tree.tag_configure("instant", foreground=theme.P.ok_text)
 
     def toggle_pause(self) -> None:
         if self.mgr.paused.is_set():
@@ -68,7 +68,7 @@ class TransfersTab:
         self.win.set_status(f"限速已套用：上傳 {up or '不限'} KB/s、下載 {down or '不限'} KB/s")
 
     def refresh(self) -> None:
-        self.pause_btn.configure(text="▶ 全部繼續" if self.mgr.paused.is_set() else "⏸ 全部暫停")
+        self.pause_btn.configure(text="全部繼續" if self.mgr.paused.is_set() else "全部暫停")
         snap = self.mgr.snapshot()
         active = [t for t in snap if t["status"] in ("running", "paused")]
         speed = sum(t["speed"] for t in active)
@@ -100,18 +100,18 @@ class DuplicatesTab:
 
     def __init__(self, win, parent: ttk.Frame):
         self.win = win
-        top = ttk.Frame(parent)
-        top.pack(fill="x")
-        ttk.Button(top, text="重新整理（用最近一次比對的索引）", command=self.refresh).pack(side="left")
-        ttk.Button(top, text="完整比對後重新整理", command=self.rescan).pack(side="left", padx=6)
-        ttk.Button(top, text="刪除選取的 115 副本", command=self.delete_selected).pack(side="left")
-        ttk.Button(top, text="開啟位置", command=self.open_selected).pack(side="left", padx=6)
-        self.summary = ttk.Label(parent, text="按「重新整理」分析重複檔案。", foreground="#555")
-        self.summary.pack(anchor="w", pady=4)
+        top = Flow(parent)
+        top.pack(fill="x", pady=(0, px(S)))
+        top.add(ttk.Button(top, text="重新整理（用最近一次比對的索引）", style="Accent.TButton", command=self.refresh),
+                ttk.Button(top, text="完整比對後重新整理", command=self.rescan),
+                ttk.Button(top, text="刪除選取的 115 副本", style="Destructive.TButton", command=self.delete_selected),
+                ttk.Button(top, text="開啟位置", style="Link.TButton", command=self.open_selected))
+        self.summary = ttk.Label(parent, text="按「重新整理」分析重複檔案。", style="Secondary.TLabel")
+        self.summary.pack(anchor="w", pady=(0, px(S)))
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(frame, columns=("where", "size", "info"), show="tree headings", height=22)
-        self.tree.heading("#0", text="SHA-1 ／ 路徑")
+        self.tree.heading("#0", text="SHA-1 ／ 路徑", anchor="w")
         self.tree.heading("where", text="位置")
         self.tree.heading("size", text="大小")
         self.tree.heading("info", text="說明")
@@ -119,7 +119,7 @@ class DuplicatesTab:
         self.tree.column("where", width=70)
         self.tree.column("size", width=90)
         self.tree.column("info", width=260)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        sb = AutoScrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")

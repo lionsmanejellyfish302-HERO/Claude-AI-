@@ -21,6 +21,7 @@ from . import app as gui_app
 from . import browser as gui_browser
 from . import dialogs as gui_dialogs
 from . import tabs as gui_tabs
+from . import theme
 
 CLOUD = "/GUI測試"
 # 內容會再加上每次執行都不同的標記：與 NAS 或 115 上既有檔案的 SHA-1 相同時，程式會依設計交給本人核對
@@ -288,14 +289,14 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
     # ------------------------------------------------------------ 總覽：帳號
     def accounts():
         d.strings["新增 115 帳號"] = ["家人帳號"]
-        d.click("＋", within=w.tab_dashboard)
+        d.click(theme.icon("add"), within=w.tab_dashboard)
         labels = [a.label for a in w.config.accounts]
         if "家人帳號" not in labels or w.acct_combo.get() != "家人帳號":
             raise GuiError(f"新增帳號失敗：{labels}")
-        d.click("－", within=w.tab_dashboard)
+        d.click(theme.icon("remove"), within=w.tab_dashboard)
         if "家人帳號" in [a.label for a in w.config.accounts]:
             raise GuiError("刪除帳號失敗")
-        d.click("－", within=w.tab_dashboard)  # 預設帳號不能刪除，只會提示
+        d.click(theme.icon("remove"), within=w.tab_dashboard)  # 預設帳號不能刪除，只會提示
         d.expect("115 連線測試通過")
         d.click("115 連線測試", within=w.tab_dashboard)
         if not any(t == "115 連線測試通過" and "✔ 秒傳" in m for _k, t, m in d.messages):
@@ -382,7 +383,7 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
     # ------------------------------------------------------------ 掃描與同步
     def scan_and_sync():
         w.nb.select(w.tab_dashboard)
-        d.click("① 掃描比對", within=w.tab_dashboard)
+        d.click("掃描比對", within=w.tab_dashboard)
         if not any(t == "比對完成" for _k, t, _m in d.messages):
             raise GuiError("沒有出現「比對完成」")
         csv_path = os.path.join(d.workdir, "比對報告.csv")
@@ -390,7 +391,7 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         d.click("匯出比對報告（CSV）", within=w.tab_dashboard)
         if not os.path.getsize(csv_path):
             raise GuiError("CSV 報告是空的")
-        d.click("② 執行同步", within=w.tab_dashboard)
+        d.click("執行同步", within=w.tab_dashboard)
         if not any(t == "同步完成" for _k, t, _m in d.messages):
             raise GuiError("沒有出現「同步完成」")
         if not os.path.exists(os.path.join(nas, "只在115.txt")):
@@ -401,8 +402,8 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
     d.step("總覽：掃描比對、匯出 CSV、執行同步", scan_and_sync)
 
     def busy_and_cancel():
-        d.click("① 掃描比對", within=w.tab_dashboard, wait=False)
-        d.click("① 掃描比對", within=w.tab_dashboard, wait=False)  # 工作中再按：只提示請稍候
+        d.click("掃描比對", within=w.tab_dashboard, wait=False)
+        d.click("掃描比對", within=w.tab_dashboard, wait=False)  # 工作中再按：只提示請稍候
         d.click("取消目前工作", within=w.tab_dashboard)
         if not any(t == "請稍候" for _k, t, _m in d.messages):
             raise GuiError("工作進行中再按沒有提示")
@@ -490,7 +491,7 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
     # ------------------------------------------------------------ 即時同步
     def realtime():
         w.nb.select(w.tab_dashboard)
-        d.click("▶ 開始即時同步", within=w.tab_dashboard)
+        d.click("開始即時同步", within=w.tab_dashboard)
         if not w.rt.running:
             raise GuiError("即時同步沒有啟動")
         p = os.path.join(nas, "即時", "新檔案.txt")
@@ -498,8 +499,8 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         with open(p, "wb") as f:
             f.write(b"realtime" + tag)
         d.settle(until=lambda: "新檔案.txt" in d.cloud_files("即時"), timeout=90, what="即時上傳")
-        d.click("■ 停止即時同步", within=w.tab_dashboard)
-        d.settle(until=lambda: not w.rt.running and str(w.rt_btn.cget("text")) == "▶ 開始即時同步",
+        d.click("停止即時同步", within=w.tab_dashboard)
+        d.settle(until=lambda: not w.rt.running and str(w.rt_btn.cget("text")) == "開始即時同步",
                  what="停止即時同步")
 
     d.step("即時同步：NAS 新增檔案自動上傳", realtime)
@@ -518,8 +519,8 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         b._local_open()
         if os.path.basename(b.local_dir) != "相片":
             raise GuiError("雙擊資料夾沒有進入")
-        d.click("↑", within=local_pane)
-        d.click("⟳", within=local_pane)
+        d.click(theme.icon("up"), within=local_pane)
+        d.click(theme.icon("refresh"), within=local_pane)
         if b.local_dir != nas:
             raise GuiError("回上一層失敗")
         d.files["askdirectory"] = [browse_dir]
@@ -552,7 +553,7 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         d.settle(what="進入 115 子資料夾")
         if b.cloud_var.get() != CLOUD + "/文件":
             raise GuiError(f"雙擊 115 資料夾沒有進入：{b.cloud_var.get()}")
-        d.click("↑", within=cloud_pane)
+        d.click(theme.icon("up"), within=cloud_pane)
         b.cloud_go_path("/")
         d.settle()
         d.strings["新資料夾"] = ["GUI瀏覽"]
@@ -564,11 +565,11 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
             raise GuiError(f"115 新資料夾失敗：{b.cloud_var.get()}")
 
         b.local_tree.selection_set(["上傳我.txt", "子資料夾"])
-        d.click("上傳選取 →", within=local_pane)
+        d.click("上傳到 115", within=local_pane)
         names = {e.name for e in b.cloud_items.values()}
         if not {"上傳我.txt", "子資料夾"} <= names:
             raise GuiError(f"上傳後 115 窗格沒有檔案：{names}")
-        d.click("⇄ 比較兩邊（MD5/SHA-1）", within=w.tab_browser)
+        d.click("比較兩邊（MD5/SHA-1）", within=w.tab_browser)
         if b.compare.get("上傳我.txt".casefold()) != "same":
             raise GuiError(f"比較結果不對：{b.compare}")
 
@@ -576,12 +577,12 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         d.strings["重新命名"] = ["已改名.txt"]
         d.click("重新命名", within=cloud_pane)
         b.search_var.set("已改名")
-        d.click("🔍 在此資料夾搜尋", within=cloud_pane)
+        d.click(theme.icon("search"), within=cloud_pane)
         if not b.cloud_var.get().startswith("搜尋") or not b.cloud_items:
             raise GuiError(f"搜尋失敗：{b.cloud_var.get()}")
-        d.click("⟳", within=cloud_pane)
+        d.click(theme.icon("refresh"), within=cloud_pane)
         b.cloud_tree.selection_set(d.cloud_iid("已改名.txt"))
-        d.click("← 下載選取", within=cloud_pane)
+        d.click("下載到 NAS", within=cloud_pane)
         if not os.path.exists(os.path.join(browse_dir, "已改名.txt")):
             raise GuiError("下載失敗")
         b.cloud_tree.selection_set(d.cloud_iid("子資料夾"))
@@ -607,10 +608,10 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         tt.refresh()
         if not tt.tree.get_children():
             raise GuiError("傳輸頁沒有任何紀錄")
-        d.click("⏸ 全部暫停", within=w.tab_transfers)
+        d.click("全部暫停", within=w.tab_transfers)
         if not tt.mgr.paused.is_set():
             raise GuiError("暫停失敗")
-        d.click("▶ 全部繼續", within=w.tab_transfers)
+        d.click("全部繼續", within=w.tab_transfers)
         tt.up_var.set("abc")
         d.expect("格式錯誤")
         d.click("套用（0 = 不限）", within=w.tab_transfers)
@@ -624,7 +625,7 @@ def _scenario(d: Driver) -> None:  # noqa: PLR0915 - 一步一步照順序操作
         tt.down_var.set("0")
         d.click("套用（0 = 不限）", within=w.tab_transfers)
         tt.tree.selection_set(tt.tree.get_children()[0])
-        d.click("✖ 取消選取的傳輸", within=w.tab_transfers)
+        d.click("取消選取的傳輸", within=w.tab_transfers)
         d.click("清除已完成", within=w.tab_transfers)
 
     d.step("傳輸：暫停／繼續、限速、取消、清除", transfers)

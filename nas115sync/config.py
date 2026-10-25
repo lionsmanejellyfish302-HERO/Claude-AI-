@@ -140,6 +140,7 @@ class Settings:
     cloud_poll_seconds: int = 30
     # 雙向/下載模式的存檔群組多久檢查一次 115 是否有新存檔（秒）
     savedata_cloud_poll_seconds: int = 120
+    appearance: str = "auto"  # 外觀：auto（跟隨 Windows）／light／dark
     # 排程：[{"id","enabled","time":"03:00","days":[0..6],"action":"sync"|"scan","mapping_ids":[]}]
     schedules: list = field(default_factory=list)
 

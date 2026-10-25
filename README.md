@@ -88,17 +88,41 @@
 
 ## 安裝
 
-### 方式一：用 Python 執行（建議先用這個試用）
+### 方式一：直接使用 exe（建議）
+
+不需要安裝 Python。兩個檔案都是單一檔案程式：
+
+| 檔案 | 用途 |
+|---|---|
+| `NAS115Sync.exe` | 圖形介面（雙擊開啟） |
+| `NAS115Sync-CLI.exe` | 指令列（排程、批次、Windows 工作排程器用），指令與下方「指令列」一節相同 |
+
+1. 取得 exe：
+   - GitHub → 此專案 → **Actions** → 最新一次「Windows build & test」→ 下方 **Artifacts** 下載 `NAS115Sync-windows-exe`（需登入 GitHub，保留 90 天）；或
+   - 自行打包：安裝 Python 後雙擊 **`build_exe.bat`**，會產生 `dist\NAS115Sync.exe`、`dist\NAS115Sync-CLI.exe` 並自動做一次自我測試。
+2. 把兩個 exe 放到固定的資料夾（例如 `C:\NAS115Sync\`，不要放在「下載」或暫存資料夾，因為開機自動啟動會記住這個位置）。
+3. 第一次開啟若出現 **「Windows 已保護您的電腦」**（SmartScreen，因為程式沒有付費數位簽章）：按 **「其他資訊」→「仍要執行」**。
+   防毒軟體若誤報（PyInstaller 打包的程式偶爾會被誤判），請將資料夾加入例外。
+4. 先試用示範模式：在資料夾空白處按 Shift + 右鍵 →「在終端機中開啟」，輸入 `.\NAS115Sync.exe --demo`。
+
+**確認在這台電腦上能正常運作**：執行
+`.\NAS115Sync-CLI.exe --self-test "$env:TEMP\nas115sync-selftest"`
+會以模擬 115（不需帳號、不影響正式設定）測試所有元件：元件載入、QR 碼、登入資訊加密、MD5/SHA-1 與超長路徑、
+雙向同步、遊戲存檔、**即時監看**、手動上傳下載與資源回收筒、程序偵測、圖形介面所有分頁。
+畫面顯示「自我測試通過」即可放心使用；失敗時把 `selftest_report.json` 提供給開發者。
+
+每次推送到 GitHub 時，Windows 實機都會自動：跑全部測試 → 打包兩個 exe → 執行打包後 exe 的自我測試（並截圖每個分頁）→ 測試指令列 exe，全部通過才會產出 exe。
+
+### 方式二：用 Python 原始碼執行
 
 1. 安裝 [Python 3.10 以上](https://www.python.org/downloads/)（安裝時勾選 **Add python.exe to PATH**）
-2. 下載本專案，雙擊 **`install.bat`**（建立虛擬環境並安裝套件）
-3. 雙擊 **`run_demo.bat`** 用示範模式試用（模擬 115，不需帳號、不會連線）
-4. 正式使用雙擊 **`run_gui.bat`**
+2. 雙擊 **`install.bat`**（建立虛擬環境並安裝套件）
+3. 雙擊 **`run_demo.bat`** 用示範模式試用；正式使用雙擊 **`run_gui.bat`**；指令列用 `run_cli.bat`
 
-### 方式二：打包成 exe
+### 其他
 
-雙擊 **`build_exe.bat`**，完成後執行 `dist\NAS115Sync\NAS115Sync.exe`。
-GitHub Actions 每次推送都會在 Windows 上跑測試並打包，也可直接下載 `NAS115Sync-windows` 產出物。
+- 同一個 Windows 帳號只會開啟一個 NAS115Sync（再開會提示「已在執行中」），避免兩份即時同步同時寫入。
+- 「設定」勾選「Windows 開機時自動啟動」後，登入 Windows 就會在背景開始即時同步。
 
 ---
 
@@ -182,6 +206,7 @@ GitHub Actions 每次推送都會在 Windows 上跑測試並打包，也可直�
 ## 指令列（進階／排程用）
 
 ```bat
+:: 用 exe 時把 run_cli.bat 換成 NAS115Sync-CLI.exe
 run_cli.bat login --client-id 你的AppID              :: 終端機顯示 QR 碼登入
 run_cli.bat accounts add 家人帳號                     :: 多帳號
 run_cli.bat login --account <帳號ID>

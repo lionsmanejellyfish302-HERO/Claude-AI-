@@ -24,6 +24,30 @@ class App:
     demo: bool = False
 
 
+def resource_path(rel: str) -> str:
+    """打包成 exe 時資源檔在 sys._MEIPASS；原始碼執行時在專案根目錄。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, rel)
+
+
+_instance_handles: list = []
+
+
+def single_instance(name: str) -> bool:
+    """Windows：同一個使用者只允許一個程式執行（避免兩份即時同步同時寫入）。其他系統一律允許。"""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    handle = k32.CreateMutexW(None, False, f"Local\\{name}")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        return False
+    _instance_handles.append(handle)  # 程式結束前保持開啟
+    return True
+
+
 def setup_logging(verbose: bool = False) -> None:
     log_dir = app_home() / "logs"
     log_dir.mkdir(exist_ok=True)

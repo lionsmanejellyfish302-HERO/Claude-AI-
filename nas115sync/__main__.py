@@ -18,6 +18,7 @@ import logging
 import sys
 import time
 
+from . import __version__
 from .app import build_app, setup_logging
 from .compare import KIND_LABELS, available_decisions
 from .config import DIRECTION_LABELS
@@ -342,12 +343,28 @@ def cmd_gui(app, args) -> int:
     return 0
 
 
+def _utf8_console() -> None:
+    """輸出導向檔案或管線時（排程、記錄）Windows 預設編碼無法輸出中文，統一改用 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure") \
+                and (getattr(stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_console()
     ap = argparse.ArgumentParser(prog="nas115sync", description="NAS ⇄ 115 網盤比對與即時同步")
     ap.add_argument("--demo", action="store_true", help="示範模式：以模擬的 115 執行，不需帳號")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--start-realtime", action="store_true", help="（圖形介面）啟動後立即開始即時同步")
     ap.add_argument("--minimized", action="store_true", help="（圖形介面）啟動時縮到工作列")
+    ap.add_argument("--version", action="store_true", help="顯示版本")
+    ap.add_argument("--self-test", metavar="報告資料夾", help="自我測試（模擬 115，不影響正式設定）")
+    ap.add_argument("--no-gui", action="store_true", help="（自我測試）略過圖形介面")
+    ap.add_argument("--tab-seconds", type=float, default=0, help="（自我測試）每個分頁停留秒數")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("login", help="登入 115 開放平台")
@@ -435,6 +452,15 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gui", help="開啟圖形介面")
 
     args = ap.parse_args(argv)
+    if args.version:
+        print(f"NAS115Sync {__version__}")
+        return 0
+    if args.self_test:
+        from .selftest import run
+
+        code = run(args.self_test, gui=not args.no_gui, tab_seconds=args.tab_seconds)
+        print(f"自我測試{'通過' if code == 0 else '失敗'}，報告：{args.self_test}")
+        return code
     setup_logging(args.verbose)
     app = build_app(demo=args.demo)
     handlers = {"login": cmd_login, "whoami": cmd_whoami, "accounts": cmd_accounts, "mapping": cmd_mapping,

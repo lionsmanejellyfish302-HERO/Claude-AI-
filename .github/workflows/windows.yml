@@ -15,11 +15,72 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: python -m pip install -r requirements-dev.txt
-      - name: Test
+      - name: Unit & integration tests (source)
         run: python -m pytest -q
-      - name: Build exe
-        run: pyinstaller --noconfirm --windowed --name NAS115Sync --collect-submodules watchdog --collect-submodules oss2 NAS115Sync.pyw
+
+      - name: Build exe (GUI + CLI, single file)
+        run: pyinstaller --noconfirm NAS115Sync.spec
+
+      - name: Self-test the packaged GUI exe on Windows (with screenshots)
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "selftest"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $p = Start-Process -FilePath "dist\NAS115Sync.exe" -ArgumentList @("--self-test", "`"$out`"", "--tab-seconds", "3") -PassThru
+          $null = $p.Handle
+          for ($i = 0; $i -lt 600 -and -not $p.HasExited; $i++) {
+            Start-Sleep -Milliseconds 500
+            foreach ($t in Get-ChildItem $out -Filter "tab_*" -ErrorAction SilentlyContinue) {
+              $png = Join-Path $out ("screen_" + $t.Name + ".png")
+              if (-not (Test-Path $png)) {
+                Start-Sleep -Milliseconds 1500
+                try {
+                  $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                  $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+                  $g = [System.Drawing.Graphics]::FromImage($bmp)
+                  $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+                  $bmp.Save($png)
+                } catch { Write-Host "screenshot failed: $_" }
+              }
+            }
+          }
+          $p.WaitForExit(300000) | Out-Null
+          Get-Content (Join-Path $out "selftest_report.json") -Encoding utf8
+          if ($p.ExitCode -ne 0) { throw "GUI exe self-test failed (exit $($p.ExitCode))" }
+
+      - name: Test the packaged CLI exe
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $env:NAS115SYNC_HOME = Join-Path $env:RUNNER_TEMP "clihome"
+          $nas = Join-Path $env:RUNNER_TEMP "NAS資料"
+          New-Item -ItemType Directory -Force (Join-Path $nas "相片") | Out-Null
+          Set-Content (Join-Path $nas "相片\a.txt") "hello" -Encoding utf8
+          Set-Content (Join-Path $nas "相片\a_copy.txt") "hello" -Encoding utf8
+          $cli = ".\dist\NAS115Sync-CLI.exe"
+          function Run { & $cli @args; if ($LASTEXITCODE -ne 0) { throw "failed: $args" } }
+          Run --version
+          Run --self-test (Join-Path $env:RUNNER_TEMP "cli-selftest") --no-gui
+          Run --demo mapping add $nas /NAS備份 --direction two_way
+          $id = ((& $cli --demo mapping list) | Select-Object -First 1).Split(" ")[0]
+          Run --demo mapping confirm $id --yes
+          Run --demo sync --yes
+          Run --demo reviews
+          Run --demo ls /NAS備份/相片
+          Run --demo dupes
+          Run --demo schedule add 03:00 --days 0,2,4
+
       - uses: actions/upload-artifact@v4
         with:
-          name: NAS115Sync-windows
-          path: dist/NAS115Sync
+          name: NAS115Sync-windows-exe
+          path: |
+            dist/NAS115Sync.exe
+            dist/NAS115Sync-CLI.exe
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-report-and-screenshots
+          path: ${{ runner.temp }}/selftest
+          retention-days: 30

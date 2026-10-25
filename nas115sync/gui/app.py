@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .. import __version__, autostart
-from ..app import App, make_client, open_in_115_browser
+from ..app import App, make_client, open_in_115_browser, resource_path, single_instance
 from ..compare import DECISIONS, KIND_LABELS, SAVEDATA_GROUP, available_decisions
 from ..config import DIRECTION_LABELS, Settings
 from ..engine import Cancelled
@@ -1154,10 +1156,26 @@ def review_text(rv) -> str:
     return "\n".join(out)
 
 
+def apply_window_icon(root: tk.Tk) -> None:
+    icon = resource_path("assets/app.ico")
+    if sys.platform == "win32" and os.path.exists(icon):
+        try:
+            root.iconbitmap(default=icon)
+        except tk.TclError:
+            pass
+
+
 def run_gui(app: App, start_realtime: bool = False, minimized: bool = False) -> None:
     enable_dpi_awareness()
+    if not single_instance("NAS115Sync_demo" if app.demo else "NAS115Sync"):
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("NAS115Sync", "NAS115Sync 已在執行中（請查看工作列）。")
+        root.destroy()
+        return
     root = tk.Tk()
     setup_fonts(root)
+    apply_window_icon(root)
     MainWindow(root, app, start_realtime=start_realtime)
     if minimized:
         root.iconify()

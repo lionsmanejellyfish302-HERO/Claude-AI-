@@ -1,0 +1,927 @@
+"""NAS115Sync 圖形介面（Tkinter，Windows 11 原生外觀）。"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from .. import __version__, autostart
+from ..app import App, open_in_115_browser
+from ..compare import DECISIONS, KIND_LABELS, SAVEDATA_GROUP, available_decisions
+from ..config import Settings
+from ..engine import Cancelled
+from ..paths import local_join, rel_parent
+from ..watcher import RealtimeSync
+from .dialogs import AddMappingDialog, ConfirmMappingDialog, QrLoginDialog, SuggestDialog
+from .util import (QueueLogHandler, UiQueue, enable_dpi_awareness, fmt_time, human_size, open_local,
+                   scrolled_text, set_text, setup_fonts, tree_with_scroll)
+
+log = logging.getLogger(__name__)
+
+GROUP_STATUS = {"pending": "待核對", "approved": "自動同步（Steam 雲存檔式）", "normal": "一般檔案", "exclude": "不同步"}
+DANGEROUS = {"delete_cloud", "delete_all", "delete_extra", "upload_replace"}
+
+SETTING_FIELDS = [
+    ("client_id", "115 開放平台 AppID（client_id）", "str"),
+    ("auto_update_linked", "已核對連結的檔案：NAS 修改後自動上傳新版並刪除 115 舊版", "bool"),
+    ("deletion_policy", "NAS 刪除檔案時", "choice",
+     [("review", "交給本人核對"), ("auto", "自動刪除 115 檔案（進 115 回收站）"), ("ignore", "不處理")]),
+    ("review_same_name_elsewhere", "新檔案與 115 其他資料夾同檔名時要本人核對", "bool"),
+    ("mass_delete_guard_min", "大量刪除保護：一次至少幾個檔案", "int"),
+    ("mass_delete_guard_ratio", "大量刪除保護：占已同步檔案比例（0~1）", "float"),
+    ("savedata_dir_names", "存檔資料夾名稱（逗號分隔）", "list"),
+    ("savedata_extensions", "存檔副檔名（逗號分隔）", "list"),
+    ("savedata_quiet_seconds", "存檔最後一次變動後靜置幾秒才上傳", "int"),
+    ("savedata_keep_versions", "115 保留存檔舊版份數（0 = 上傳後刪除舊版）", "int"),
+    ("savedata_mirror_deletes", "NAS 刪除存檔時同步刪除 115 上的存檔", "bool"),
+    ("stable_seconds", "一般檔案停止變動幾秒後才上傳", "float"),
+    ("rescan_interval_minutes", "定期完整比對間隔（分鐘，補抓網路磁碟漏掉的事件）", "int"),
+    ("use_polling_observer", "改用輪詢監看（NAS 不回報變動事件時勾選）", "bool"),
+    ("polling_interval_seconds", "輪詢間隔（秒）", "int"),
+    ("instant_first", "先對全部檔案嘗試秒傳，再實際上傳其餘檔案", "bool"),
+    ("upload_workers", "同時上傳數", "int"),
+    ("hash_workers", "同時計算 MD5/SHA-1 數", "int"),
+    ("api_min_interval", "115 API 最小呼叫間隔（秒，避免被限流）", "float"),
+    ("part_size_mb", "大檔分片大小（MB）", "int"),
+    ("browser_path", "115 瀏覽器執行檔（空白 = 自動尋找）", "str"),
+    ("ignore_patterns", "忽略的檔名規則（每行一個，支援 * ?）", "lines"),
+]
+
+
+class MainWindow:
+    def __init__(self, root: tk.Tk, app: App, start_realtime: bool = False):
+        self.root, self.app = root, app
+        self.engine, self.db, self.config, self.cloud = app.engine, app.db, app.config, app.cloud
+        self.ui = UiQueue(root)
+        self.rt = RealtimeSync(self.engine)
+        self.busy = False
+        self._last_progress = 0.0
+        self._reviews_dirty = False
+        self.review_items: dict[str, object] = {}
+        self.group_items: dict[str, tuple] = {}
+
+        root.title(f"NAS115Sync {__version__} — NAS ⇄ 115 網盤比對與即時同步" + ("（示範模式）" if app.demo else ""))
+        root.geometry("1200x780")
+        root.minsize(980, 620)
+        style = ttk.Style(root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        style.configure("Big.TButton", padding=(12, 6))
+
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        self._build_dashboard()
+        self._build_mappings()
+        self._build_reviews()
+        self._build_savedata()
+        self._build_log()
+        self._build_settings()
+        self.statusbar = ttk.Label(root, text="就緒", anchor="w", padding=(10, 4))
+        self.statusbar.pack(fill="x")
+
+        handler = QueueLogHandler(self.ui, self._append_log)
+        logging.getLogger().addHandler(handler)
+        self.engine.listeners.append(lambda ev, data: self.ui.call(self._on_engine_event, ev, data))
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.refresh_all()
+        self._refresh_account()
+        self._tick()
+        if start_realtime:
+            root.after(1500, self.toggle_realtime)
+
+    # ================================================================ 背景工作
+    def run_bg(self, title: str, fn, on_done=None) -> None:
+        if self.busy:
+            messagebox.showinfo("請稍候", "目前已有工作進行中", parent=self.root)
+            return
+        self.busy = True
+        self.engine.cancel_event.clear()
+        self._set_status(f"{title}…")
+        self.cancel_btn.configure(state="normal")
+
+        def target():
+            try:
+                res = fn()
+                if on_done:
+                    self.ui.call(on_done, res)
+                self.ui.call(self._set_status, f"{title}完成")
+            except Cancelled:
+                self.ui.call(self._set_status, f"{title}已取消")
+            except Exception as e:  # noqa: BLE001
+                log.exception("%s失敗", title)
+                self.ui.call(messagebox.showerror, f"{title}失敗", str(e))
+                self.ui.call(self._set_status, f"{title}失敗：{e}")
+            finally:
+                self.engine.cancel_event.clear()  # 取消只針對這個工作，不影響即時同步
+                self.ui.call(self._idle)
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def _idle(self) -> None:
+        self.busy = False
+        self.cancel_btn.configure(state="disabled")
+        self.progress.configure(value=0)
+        self.refresh_all()
+
+    def cancel(self) -> None:
+        self.engine.cancel_event.set()
+        self._set_status("取消中…")
+
+    def _set_status(self, text: str) -> None:
+        self.statusbar.configure(text=text)
+
+    def progress_cb(self, stage: str, done: int, total: int, text: str) -> None:
+        now = time.monotonic()
+        if now - self._last_progress < 0.1 and done != total:
+            return
+        self._last_progress = now
+        self.ui.call(self._show_progress, stage, done, total, text)
+
+    def _show_progress(self, stage, done, total, text) -> None:
+        if total:
+            self.progress.configure(mode="determinate", maximum=total, value=done)
+            pct = done * 100 // max(1, total)
+            size_info = f"（{human_size(done)} / {human_size(total)}）" if stage.startswith("計算") else \
+                f"（{done}/{total}）"
+            self.stage_label.configure(text=f"{stage} {pct}% {size_info}")
+        else:
+            self.progress.configure(mode="determinate", maximum=100, value=(done % 100))
+            self.stage_label.configure(text=f"{stage}：{done}")
+        self.file_label.configure(text=text)
+
+    def _on_engine_event(self, ev: str, data: dict) -> None:
+        if ev == "file_progress":
+            now = time.monotonic()
+            if now - self._last_progress >= 0.2 or data["done"] == data["total"]:
+                self._last_progress = now
+                pct = data["done"] * 100 // max(1, data["total"])
+                self.file_label.configure(text=f"上傳中 {data['rel_path']}  {pct}%  "
+                                               f"{human_size(data['done'])}/{human_size(data['total'])}")
+        elif ev == "uploaded":
+            how = "秒傳" if data["instant"] else "上傳"
+            self._set_status(f"{how}完成：{data['rel_path']}")
+        elif ev == "reviews_changed":
+            self._reviews_dirty = True
+        elif ev == "plans":
+            self._show_plans(data["plans"])
+        elif ev == "realtime":
+            self._update_rt_button()
+        elif ev == "savedata_dirty":
+            self._set_status(f"偵測到存檔變動，等待遊戲結束／靜置後上傳：{data['group']}")
+        elif ev == "savedata_synced":
+            self._set_status(f"存檔已同步到 115：{data['group']}")
+            self._refresh_savedata()
+        elif ev == "failed":
+            self._set_status(f"上傳失敗：{data['rel_path']}：{data['error']}")
+
+    def _tick(self) -> None:
+        try:
+            if self._reviews_dirty:
+                self._reviews_dirty = False
+                self._refresh_reviews()
+            self._refresh_stats()
+        finally:
+            self.root.after(3000, self._tick)
+
+    def refresh_all(self) -> None:
+        self._refresh_mappings()
+        self._refresh_reviews()
+        self._refresh_savedata()
+        self._refresh_stats()
+        self._update_rt_button()
+
+    # ================================================================ 總覽
+    def _build_dashboard(self) -> None:
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text="總覽")
+
+        acct = ttk.LabelFrame(f, text="115 帳號", padding=10)
+        acct.pack(fill="x")
+        self.acct_label = ttk.Label(acct, text="檢查中…", font=("", 11, "bold"))
+        self.acct_label.pack(side="left")
+        self.btn_logout = ttk.Button(acct, text="登出", command=self.logout)
+        self.btn_logout.pack(side="right")
+        self.btn_rt = ttk.Button(acct, text="貼上 refresh_token", command=self.login_token)
+        self.btn_rt.pack(side="right", padx=4)
+        self.btn_qr = ttk.Button(acct, text="115 App 掃碼登入", command=self.login_qr)
+        self.btn_qr.pack(side="right")
+        if self.app.demo:
+            for b in (self.btn_logout, self.btn_rt, self.btn_qr):
+                b.configure(state="disabled")
+
+        act = ttk.LabelFrame(f, text="同步", padding=10)
+        act.pack(fill="x", pady=10)
+        row = ttk.Frame(act)
+        row.pack(fill="x")
+        ttk.Button(row, text="① 掃描比對", style="Big.TButton", command=self.scan).pack(side="left")
+        ttk.Button(row, text="② 執行同步", style="Big.TButton", command=self.execute).pack(side="left", padx=6)
+        self.rt_btn = ttk.Button(row, text="▶ 開始即時同步", style="Big.TButton", command=self.toggle_realtime)
+        self.rt_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(row, text="取消目前工作", command=self.cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=6)
+        ttk.Label(act, text="① 掃描 NAS 與 115、計算 MD5/SHA-1 並比對（不會上傳）；"
+                            "② 執行可自動處理的項目（秒傳優先）；需本人核對的項目請到「待核對」頁處理。",
+                  foreground="#555").pack(anchor="w", pady=(6, 0))
+        self.progress = ttk.Progressbar(act, mode="determinate")
+        self.progress.pack(fill="x", pady=(8, 2))
+        self.stage_label = ttk.Label(act, text="")
+        self.stage_label.pack(anchor="w")
+        self.file_label = ttk.Label(act, text="", foreground="#555")
+        self.file_label.pack(anchor="w")
+
+        stats = ttk.LabelFrame(f, text="統計", padding=10)
+        stats.pack(fill="x")
+        self.stats_label = ttk.Label(stats, text="", justify="left")
+        self.stats_label.pack(side="left")
+        ttk.Button(stats, text="前往待核對 →", command=lambda: self.nb.select(2)).pack(side="right")
+
+        plan = ttk.LabelFrame(f, text="最近一次比對結果", padding=10)
+        plan.pack(fill="both", expand=True, pady=(10, 0))
+        self.plan_tree = tree_with_scroll(plan, [
+            ("map", "對應（NAS ⇄ 115）", 360), ("up", "待上傳", 70), ("bytes", "大小", 90), ("same", "已相同", 70),
+            ("rev", "待核對", 70), ("only", "僅 115 有", 80), ("del", "刪除", 60), ("warn", "警告", 300)], height=6)
+        self.plan_tree.frame.pack(fill="both", expand=True)
+
+    def _refresh_account(self) -> None:
+        if self.app.demo:
+            self.acct_label.configure(text="示範模式（模擬 115，不會連線）")
+            return
+        if not self.cloud.is_logged_in():
+            self.acct_label.configure(text="尚未登入 115", foreground="#b00000")
+            return
+
+        def work():
+            try:
+                name = self.cloud.user_label()
+                self.ui.call(lambda: self.acct_label.configure(text=f"已登入：{name}", foreground="#006000"))
+            except Exception as e:  # noqa: BLE001
+                msg = f"登入失效：{e}"
+                self.ui.call(lambda: self.acct_label.configure(text=msg, foreground="#b00000"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def login_qr(self) -> None:
+        s = self.config.settings
+        if not s.client_id:
+            cid = simpledialog.askstring(
+                "115 開放平台 AppID",
+                "掃碼登入需要 115 開放平台（open.115.com）的 AppID。\n"
+                "請到 115 開放平台申請應用後填入 AppID；\n若已有 refresh_token，可改用「貼上 refresh_token」。",
+                parent=self.root)
+            if not cid:
+                return
+            s.client_id = cid.strip()
+            self.config.save()
+            self.settings_vars["client_id"].set(s.client_id)
+        self.cloud.client_id = s.client_id
+        if QrLoginDialog(self.root, self.cloud, self.ui).modal():
+            messagebox.showinfo("登入成功", "已登入 115", parent=self.root)
+        self._refresh_account()
+
+    def login_token(self) -> None:
+        rt = simpledialog.askstring("貼上 refresh_token", "請貼上 115 開放平台的 refresh_token：", parent=self.root)
+        if not rt:
+            return
+        self.run_bg("登入 115", lambda: self.cloud.login_with_refresh_token(rt), lambda _: self._refresh_account())
+
+    def logout(self) -> None:
+        if messagebox.askyesno("登出", "確定要登出 115？（即時同步會停止）", parent=self.root):
+            if self.rt.running:
+                self.rt.stop()
+            self.cloud.logout()
+            self._refresh_account()
+
+    def _refresh_stats(self) -> None:
+        ms = self.config.mappings
+        st = self.db.upload_stats()
+        lines = [
+            f"路徑對應：{sum(m.confirmed for m in ms)} / {len(ms)} 已核對",
+            f"待核對：{self.db.count_pending()} 項",
+            f"秒傳：{st.get('instant_n', 0)} 次（省下 {human_size(st.get('instant_bytes', 0))} 流量）　"
+            f"實際上傳：{st.get('real_n', 0)} 次（{human_size(st.get('real_bytes', 0))}）",
+            f"即時同步：{'執行中' if self.rt.running else '未啟動'}"
+            + (f"（待處理 {self.rt.pending_count()} 項）" if self.rt.running else ""),
+        ]
+        self.stats_label.configure(text="\n".join(lines))
+        n = self.db.count_pending()
+        self.nb.tab(2, text=f"待核對（{n}）" if n else "待核對")
+
+    def _show_plans(self, plans) -> None:
+        self.plan_tree.delete(*self.plan_tree.get_children())
+        for p in plans:
+            m = self.config.get_mapping(p.mapping_id)
+            s = p.summary()
+            label = f"{m.local_path} ⇄ {m.cloud_path}" if m else p.mapping_id
+            self.plan_tree.insert("", "end", values=(label, s["uploads"], human_size(s["upload_bytes"]),
+                                                     s["identical"], s["reviews"], s["cloud_only"], s["deletes"],
+                                                     "；".join(p.warnings)))
+
+    def scan(self) -> None:
+        if not self._ready_to_sync():
+            return
+        self.run_bg("掃描比對", lambda: self.engine.analyze(progress=self.progress_cb),
+                    lambda plans: self._after_scan(plans))
+
+    def _after_scan(self, plans) -> None:
+        self._show_plans(plans)
+        n_up = sum(len(p.uploads) for p in plans)
+        msg = f"比對完成：可自動上傳 {n_up} 個檔案，待本人核對 {self.db.count_pending()} 項。"
+        warns = [w for p in plans for w in p.warnings]
+        if warns:
+            msg += "\n\n警告：\n" + "\n".join(warns)
+        messagebox.showinfo("比對完成", msg, parent=self.root)
+
+    def execute(self) -> None:
+        plans = self.engine.last_plans
+        if not plans:
+            messagebox.showinfo("尚未比對", "請先按「① 掃描比對」", parent=self.root)
+            return
+        n = sum(len(p.uploads) + len(p.deletes) + len(p.mkdirs) for p in plans)
+        if n and not messagebox.askyesno("執行同步", f"將執行 {n} 項自動同步（上傳時優先嘗試秒傳）。繼續？",
+                                         parent=self.root):
+            return
+
+        def done(stats):
+            self.engine.last_plans = []
+            messagebox.showinfo("同步完成",
+                                f"上傳 {stats['uploaded']} 個（其中秒傳 {stats['instant']} 個）\n"
+                                f"失敗 {stats['failed']} 個（已列入待核對）\n刪除 {stats['deleted']} 個\n"
+                                f"建立資料夾 {stats['mkdirs']} 個", parent=self.root)
+
+        self.run_bg("同步", lambda: self.engine.execute(plans, progress=self.progress_cb), done)
+
+    def toggle_realtime(self) -> None:
+        if self.rt.running:
+            self._set_status("停止即時同步中…")
+            threading.Thread(target=lambda: (self.rt.stop(), self.ui.call(self._update_rt_button)),
+                             daemon=True).start()
+            return
+        if not self._ready_to_sync():
+            return
+        try:
+            self.rt.start()
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("無法啟動即時同步", str(e), parent=self.root)
+        self._update_rt_button()
+
+    def _update_rt_button(self) -> None:
+        self.rt_btn.configure(text="■ 停止即時同步" if self.rt.running else "▶ 開始即時同步")
+
+    def _ready_to_sync(self) -> bool:
+        if not self.app.demo and not self.cloud.is_logged_in():
+            messagebox.showwarning("尚未登入", "請先登入 115", parent=self.root)
+            return False
+        if not self.config.active_mappings():
+            messagebox.showwarning("沒有已核對的路徑", "請到「路徑對應」新增對應並按「核對確認」", parent=self.root)
+            self.nb.select(1)
+            return False
+        return True
+
+    # ================================================================ 路徑對應
+    def _build_mappings(self) -> None:
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text="路徑對應")
+        ttk.Label(f, text="只有「已核對」的對應才會比對與同步。新增或自動建議的對應都必須由本人按「核對確認」。",
+                  foreground="#a05000").pack(anchor="w", pady=(0, 6))
+        self.map_tree = tree_with_scroll(f, [("state", "狀態", 90), ("local", "NAS 資料夾", 380),
+                                             ("cloud", "115 資料夾", 300), ("type", "類型", 90),
+                                             ("at", "核對時間", 150)], height=16)
+        self.map_tree.frame.pack(fill="both", expand=True)
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=8)
+        for text, cmd in (("新增…", self.add_mapping), ("自動建議（NAS 所有資料夾）…", self.suggest_mappings),
+                          ("核對確認…", self.confirm_mapping), ("取消核對", self.unconfirm_mapping),
+                          ("啟用/停用", self.toggle_mapping), ("刪除", self.remove_mapping),
+                          ("開啟 NAS 資料夾", self.open_mapping_local),
+                          ("在 115 瀏覽器開啟", self.open_mapping_cloud)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+        self.map_tree.bind("<Double-1>", lambda e: self.confirm_mapping())
+
+    def _refresh_mappings(self) -> None:
+        sel = set(self.map_tree.selection())
+        self.map_tree.delete(*self.map_tree.get_children())
+        for m in self.config.mappings:
+            state = ("✔ 已核對" if m.confirmed else "✘ 待核對") + ("" if m.enabled else "（停用）")
+            self.map_tree.insert("", "end", iid=m.id, values=(state, m.local_path, m.cloud_path,
+                                                              "遊戲存檔" if m.savedata else "一般",
+                                                              m.confirmed_at))
+        self.map_tree.selection_set([i for i in sel if self.map_tree.exists(i)])
+
+    def _selected_mappings(self):
+        return [self.config.get_mapping(i) for i in self.map_tree.selection() if self.config.get_mapping(i)]
+
+    def add_mapping(self) -> None:
+        r = AddMappingDialog(self.root).modal()
+        if r:
+            m = self.config.add_mapping(r[0], r[1], savedata=r[2])
+            self._refresh_mappings()
+            self.map_tree.selection_set(m.id)
+            if messagebox.askyesno("核對路徑", "要現在核對這個路徑對應嗎？", parent=self.root):
+                self.confirm_mapping()
+
+    def suggest_mappings(self) -> None:
+        if not self.app.demo and not self.cloud.is_logged_in():
+            messagebox.showwarning("尚未登入", "請先登入 115", parent=self.root)
+            return
+        items = SuggestDialog(self.root, self.cloud, self.ui).modal()
+        if items:
+            existing = {(m.local_path, m.cloud_path) for m in self.config.mappings}
+            for s in items:
+                if (s.local_path, s.cloud_path) not in existing:
+                    self.config.add_mapping(s.local_path, s.cloud_path)
+            self._refresh_mappings()
+            messagebox.showinfo("已加入", f"已加入 {len(items)} 個「待核對」對應，請逐一選取並按「核對確認」。",
+                                parent=self.root)
+
+    def confirm_mapping(self) -> None:
+        ms = self._selected_mappings()
+        if len(ms) != 1:
+            messagebox.showinfo("請選取", "請選取一個對應來核對", parent=self.root)
+            return
+        m = ms[0]
+        r = ConfirmMappingDialog(self.root, m, self.cloud, self.config.mappings, self.ui,
+                                 self.config.settings.browser_path).modal()
+        if not r:
+            return
+
+        def work():
+            cid = r["cid"] if not r["create"] else self.cloud.ensure_path(m.cloud_path)
+            self.config.confirm_mapping(m.id, cid)
+
+        self.run_bg("確認路徑對應", work, lambda _: self._refresh_mappings())
+
+    def unconfirm_mapping(self) -> None:
+        for m in self._selected_mappings():
+            self.config.unconfirm_mapping(m.id)
+        self._refresh_mappings()
+
+    def toggle_mapping(self) -> None:
+        for m in self._selected_mappings():
+            m.enabled = not m.enabled
+        self.config.save()
+        self._refresh_mappings()
+
+    def remove_mapping(self) -> None:
+        ms = self._selected_mappings()
+        if ms and messagebox.askyesno("刪除對應", f"刪除 {len(ms)} 個對應？（不會刪除任何檔案）", parent=self.root):
+            for m in ms:
+                self.config.remove_mapping(m.id)
+            self._refresh_mappings()
+
+    def open_mapping_local(self) -> None:
+        for m in self._selected_mappings()[:1]:
+            open_local(m.local_path)
+
+    def open_mapping_cloud(self) -> None:
+        for m in self._selected_mappings()[:1]:
+            def work(m=m):
+                cid = m.cloud_cid or self.cloud.resolve_path(m.cloud_path)
+                if cid is None:
+                    raise ValueError(f"115 上找不到 {m.cloud_path}")
+                open_in_115_browser(self.cloud.web_url(cid), self.config.settings.browser_path)
+            self.run_bg("開啟 115", work)
+
+    # ================================================================ 待核對
+    def _build_reviews(self) -> None:
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text="待核對")
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        ttk.Label(top, text="類型：").pack(side="left")
+        self.kind_filter = ttk.Combobox(top, state="readonly", width=28,
+                                        values=["全部"] + [KIND_LABELS[k] for k in DECISIONS])
+        self.kind_filter.set("全部")
+        self.kind_filter.pack(side="left")
+        self.kind_filter.bind("<<ComboboxSelected>>", lambda e: self._refresh_reviews())
+        ttk.Button(top, text="重新整理", command=self._refresh_reviews).pack(side="left", padx=6)
+        ttk.Button(top, text="全選此類型", command=self._select_all_reviews).pack(side="left")
+        ttk.Label(top, text="可多選同類型項目一次處理", foreground="#555").pack(side="left", padx=10)
+
+        pane = ttk.PanedWindow(f, orient="horizontal")
+        pane.pack(fill="both", expand=True, pady=6)
+        left = ttk.Frame(pane)
+        self.rev_tree = tree_with_scroll(left, [("id", "#", 50), ("kind", "類型", 150), ("path", "路徑", 360)],
+                                         height=20)
+        self.rev_tree.frame.pack(fill="both", expand=True)
+        self.rev_tree.bind("<<TreeviewSelect>>", lambda e: self._show_review())
+        pane.add(left, weight=3)
+        right = ttk.Frame(pane)
+        self.rev_detail = scrolled_text(right, height=20, wrap="char", state="disabled", font=("Consolas", 10))
+        self.rev_detail.frame.pack(fill="both", expand=True)
+        self.proc_frame = ttk.Frame(right)
+        ttk.Label(self.proc_frame, text="遊戲執行檔（選填，逗號分隔，執行中不上傳）：").pack(side="left")
+        self.proc_var = tk.StringVar()
+        ttk.Entry(self.proc_frame, textvariable=self.proc_var, width=30).pack(side="left", fill="x", expand=True)
+        self.decision_bar = ttk.Frame(right)
+        self.decision_bar.pack(fill="x", pady=(6, 0))
+        nav = ttk.Frame(right)
+        nav.pack(fill="x", pady=(6, 0))
+        ttk.Button(nav, text="開啟 NAS 位置", command=self._open_review_local).pack(side="left")
+        ttk.Button(nav, text="在 115 瀏覽器開啟", command=self._open_review_cloud).pack(side="left", padx=6)
+        pane.add(right, weight=4)
+
+    def _refresh_reviews(self) -> None:
+        label = self.kind_filter.get()
+        kind = next((k for k, v in KIND_LABELS.items() if v == label), None)
+        sel = set(self.rev_tree.selection())
+        self.rev_tree.delete(*self.rev_tree.get_children())
+        self.review_items.clear()
+        for rv in self.db.list_reviews("pending", kind=kind):
+            iid = str(rv.id)
+            self.review_items[iid] = rv
+            m = self.config.get_mapping(rv.mapping_id)
+            path = rv.rel_path or "（整個對應）"
+            if m:
+                path = f"{path}    [{m.cloud_path}]"
+            self.rev_tree.insert("", "end", iid=iid, values=(rv.id, KIND_LABELS.get(rv.kind, rv.kind), path))
+        keep = [i for i in sel if self.rev_tree.exists(i)]
+        if keep:
+            self.rev_tree.selection_set(keep)
+        else:
+            self._show_review()
+        self._refresh_stats()
+
+    def _select_all_reviews(self) -> None:
+        sel = self._selected_reviews()
+        kind = sel[0].kind if sel else None
+        self.rev_tree.selection_set([i for i, rv in self.review_items.items() if kind is None or rv.kind == kind])
+
+    def _selected_reviews(self):
+        return [self.review_items[i] for i in self.rev_tree.selection() if i in self.review_items]
+
+    def _show_review(self) -> None:
+        for w in self.decision_bar.winfo_children():
+            w.destroy()
+        self.proc_frame.pack_forget()
+        sel = self._selected_reviews()
+        if not sel:
+            set_text(self.rev_detail, "請在左側選取一個待核對項目。")
+            return
+        set_text(self.rev_detail, review_text(sel[0]) + (f"\n\n（共選取 {len(sel)} 項）" if len(sel) > 1 else ""))
+        kinds = {rv.kind for rv in sel}
+        if len(kinds) != 1:
+            ttk.Label(self.decision_bar, text="選取了不同類型的項目，請只選同一類型以一次處理。").pack(anchor="w")
+            return
+        kind = kinds.pop()
+        opts = available_decisions(kind, sel[0].details)
+        if len(sel) > 1:  # 多選時只顯示每一項都可用的決定
+            common = set.intersection(*[{d for d, _ in available_decisions(rv.kind, rv.details)} for rv in sel])
+            opts = [o for o in opts if o[0] in common]
+        if kind == SAVEDATA_GROUP:
+            self.proc_frame.pack(fill="x", pady=(6, 0), before=self.decision_bar)
+        for i, (decision, label) in enumerate(opts):
+            ttk.Button(self.decision_bar, text=label, command=lambda d=decision, lb=label: self._decide(d, lb)).grid(
+                row=i // 2, column=i % 2, sticky="we", padx=(0, 6), pady=2)
+        for c in range(2):
+            self.decision_bar.columnconfigure(c, weight=1, uniform="decision")
+
+    def _decide(self, decision: str, label: str) -> None:
+        sel = self._selected_reviews()
+        if not sel:
+            return
+        if decision in DANGEROUS and not messagebox.askyesno(
+                "請確認", f"確定對 {len(sel)} 個項目執行「{label}」？\n（115 刪除的檔案會進入 115 回收站）",
+                parent=self.root):
+            return
+        procs = [p.strip() for p in self.proc_var.get().split(",") if p.strip()]
+        extra = {"process_names": procs} if procs else {}
+        ids = [rv.id for rv in sel]
+
+        def work():
+            ok, errors = 0, []
+            for i, rid in enumerate(ids, 1):
+                if self.engine.cancel_event.is_set():
+                    raise Cancelled("已取消")
+                try:
+                    self.engine.apply_review(rid, decision, extra)
+                    ok += 1
+                except Cancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"#{rid}：{e}")
+                self.progress_cb("處理核對項目", i, len(ids), str(rid))
+            return ok, errors
+
+        def done(res):
+            ok, errors = res
+            msg = f"完成 {ok} 項"
+            if errors:
+                msg += f"，失敗 {len(errors)} 項：\n" + "\n".join(errors[:15])
+                messagebox.showwarning("處理結果", msg, parent=self.root)
+            else:
+                self._set_status(msg)
+
+        self.run_bg(f"「{label}」", work, done)
+
+    def _open_review_local(self) -> None:
+        sel = self._selected_reviews()
+        if sel:
+            d = sel[0].details
+            path = (d.get("local") or {}).get("path") or d.get("local_dir") or d.get("local_root")
+            if path:
+                open_local(path)
+
+    def _open_review_cloud(self) -> None:
+        sel = self._selected_reviews()
+        if not sel:
+            return
+        rv = sel[0]
+        m = self.config.get_mapping(rv.mapping_id)
+        if not m:
+            return
+        cloud = rv.details.get("cloud") or []
+        rel_dir = rv.rel_path if rv.kind == SAVEDATA_GROUP else rel_parent(rv.rel_path)
+        cid = (cloud[0].get("pid") if cloud else None) or self.db.cloud_dir(m.id, rel_dir) or m.cloud_cid
+        if cid:
+            open_in_115_browser(self.cloud.web_url(cid), self.config.settings.browser_path)
+
+    # ================================================================ 遊戲存檔
+    def _build_savedata(self) -> None:
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text="遊戲存檔")
+        ttk.Label(f, text="核可後的存檔資料夾會像 Steam 雲存檔一樣：遊戲寫完存檔（靜置一段時間、遊戲程序結束）後，"
+                          "自動上傳到 115 對應資料夾並刪除 115 上的舊版。", wraplength=1100,
+                  foreground="#555").pack(anchor="w", pady=(0, 6))
+        self.save_tree = tree_with_scroll(f, [("map", "對應", 260), ("dir", "存檔資料夾", 330), ("state", "狀態", 190),
+                                              ("proc", "遊戲程序", 160), ("last", "上次上傳", 150)], height=16)
+        self.save_tree.frame.pack(fill="both", expand=True)
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=8)
+        for text, cmd in (("核可自動同步", lambda: self._group_action("approve")),
+                          ("當一般檔案", lambda: self._group_action("normal")),
+                          ("不同步", lambda: self._group_action("exclude")),
+                          ("設定遊戲程序…", self._set_group_procs),
+                          ("立即同步此存檔", self._sync_group_now),
+                          ("開啟 NAS 位置", self._open_group_local)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+
+    def _refresh_savedata(self) -> None:
+        self.save_tree.delete(*self.save_tree.get_children())
+        self.group_items = {}
+        for g in self.db.list_groups():
+            m = self.config.get_mapping(g.mapping_id)
+            if not m:
+                continue
+            iid = f"{g.mapping_id}|{g.rel_key}"
+            self.group_items[iid] = (m, g)
+            self.save_tree.insert("", "end", iid=iid, values=(
+                m.cloud_path, g.rel_dir or "（對應根目錄）", GROUP_STATUS.get(g.status, g.status),
+                ", ".join(g.process_names), fmt_time(g.last_upload)))
+
+    def _selected_groups(self):
+        return [self.group_items[i] for i in self.save_tree.selection() if i in self.group_items]
+
+    def _group_action(self, decision: str) -> None:
+        groups = self._selected_groups()
+        if not groups:
+            return
+
+        def work():
+            for m, g in groups:
+                self.engine.change_savedata_group(m, g.rel_dir, decision)
+
+        self.run_bg("變更存檔設定", work, lambda _: self._refresh_savedata())
+
+    def _set_group_procs(self) -> None:
+        groups = self._selected_groups()
+        if not groups:
+            return
+        cur = ", ".join(groups[0][1].process_names)
+        s = simpledialog.askstring("遊戲程序", "遊戲執行檔名稱（逗號分隔，例如 eldenring.exe）。\n"
+                                             "這些程序執行中時不會上傳存檔，等遊戲結束才上傳：",
+                                   initialvalue=cur, parent=self.root)
+        if s is None:
+            return
+        for m, g in groups:
+            self.db.upsert_group(m.id, g.rel_dir, process_names=[p for p in s.split(",")])
+        self._refresh_savedata()
+
+    def _sync_group_now(self) -> None:
+        groups = [(m, g) for m, g in self._selected_groups() if g.status == "approved"]
+        if not groups:
+            messagebox.showinfo("無法同步", "請選取「自動同步」狀態的存檔資料夾", parent=self.root)
+            return
+        self.run_bg("同步存檔", lambda: [self.engine.sync_savedata_group(m, g.rel_dir) for m, g in groups],
+                    lambda _: self._refresh_savedata())
+
+    def _open_group_local(self) -> None:
+        for m, g in self._selected_groups()[:1]:
+            open_local(local_join(m.local_path, g.rel_dir))
+
+    # ================================================================ 紀錄
+    def _build_log(self) -> None:
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text="紀錄")
+        pane = ttk.PanedWindow(f, orient="vertical")
+        pane.pack(fill="both", expand=True)
+        top = ttk.Frame(pane)
+        self.log_text = scrolled_text(top, height=12, state="disabled", font=("Consolas", 9))
+        self.log_text.frame.pack(fill="both", expand=True)
+        self.log_text.tag_configure("warn", foreground="#a05000")
+        self.log_text.tag_configure("error", foreground="#b00000")
+        pane.add(top, weight=1)
+        bottom = ttk.Frame(pane)
+        bar = ttk.Frame(bottom)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="同步歷史").pack(side="left")
+        ttk.Button(bar, text="重新整理", command=self._refresh_history).pack(side="left", padx=6)
+        self.hist_tree = tree_with_scroll(bottom, [("ts", "時間", 150), ("action", "動作", 130), ("path", "路徑", 420),
+                                                   ("how", "方式", 90), ("size", "大小", 90), ("ok", "結果", 60),
+                                                   ("detail", "說明", 250)], height=10)
+        self.hist_tree.frame.pack(fill="both", expand=True)
+        pane.add(bottom, weight=1)
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._on_tab())
+
+    def _on_tab(self) -> None:
+        idx = self.nb.index(self.nb.select())
+        if idx == 4:
+            self._refresh_history()
+        elif idx == 3:
+            self._refresh_savedata()
+
+    def _append_log(self, line: str, level: int) -> None:
+        t = self.log_text
+        t.configure(state="normal")
+        tag = "error" if level >= logging.ERROR else "warn" if level >= logging.WARNING else ""
+        t.insert("end", line + "\n", tag)
+        if int(t.index("end-1c").split(".")[0]) > 3000:
+            t.delete("1.0", "500.0")
+        t.see("end")
+        t.configure(state="disabled")
+
+    def _refresh_history(self) -> None:
+        self.hist_tree.delete(*self.hist_tree.get_children())
+        for h in self.db.recent_history(500):
+            how = ("秒傳" if h["instant"] else "實際上傳") if str(h["action"]).startswith("upload") else ""
+            self.hist_tree.insert("", "end", values=(fmt_time(h["ts"]), h["action"], h["rel_path"], how,
+                                                     human_size(h["size"]) if h["size"] else "",
+                                                     "成功" if h["ok"] else "失敗", h["detail"] or ""))
+
+    # ================================================================ 設定
+    def _build_settings(self) -> None:
+        outer = ttk.Frame(self.nb)
+        self.nb.add(outer, text="設定")
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        f = ttk.Frame(canvas, padding=12)
+        f.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=f, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units")
+                        if self.nb.index(self.nb.select()) == 5 else None)
+
+        s = self.config.settings
+        self.settings_vars: dict[str, object] = {}
+        for row, spec in enumerate(SETTING_FIELDS):
+            name, label, typ = spec[0], spec[1], spec[2]
+            val = getattr(s, name)
+            if typ == "bool":
+                var = tk.BooleanVar(value=bool(val))
+                ttk.Checkbutton(f, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+            elif typ == "lines":
+                ttk.Label(f, text=label).grid(row=row, column=0, sticky="nw", pady=3)
+                var = tk.Text(f, height=8, width=50)
+                var.insert("1.0", "\n".join(val))
+                var.grid(row=row, column=1, sticky="we", pady=3)
+            elif typ == "choice":
+                ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=3)
+                choices = spec[3]
+                var = tk.StringVar(value=dict(choices).get(val, val))
+                cb = ttk.Combobox(f, textvariable=var, values=[c[1] for c in choices], state="readonly", width=40)
+                cb.grid(row=row, column=1, sticky="w", pady=3)
+            else:
+                ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=3)
+                text = ", ".join(val) if typ == "list" else str(val)
+                var = tk.StringVar(value=text)
+                ttk.Entry(f, textvariable=var, width=60 if typ in ("str", "list") else 12).grid(
+                    row=row, column=1, sticky="w", pady=3)
+            self.settings_vars[name] = var
+        row = len(SETTING_FIELDS)
+        self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
+        ttk.Checkbutton(f, text="Windows 開機時自動啟動並開始即時同步", variable=self.autostart_var,
+                        state="normal" if autostart.supported() else "disabled").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(12, 3))
+        bar = ttk.Frame(f)
+        bar.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=10)
+        ttk.Button(bar, text="儲存設定", style="Big.TButton", command=self.save_settings).pack(side="left")
+        ttk.Button(bar, text="選擇 115 瀏覽器…", command=self._pick_browser).pack(side="left", padx=6)
+        ttk.Label(f, text="AppID、API 間隔、分片大小在重新啟動程式後生效；即時同步相關設定在重新開始即時同步後生效。",
+                  foreground="#555").grid(row=row + 2, column=0, columnspan=2, sticky="w")
+        f.columnconfigure(1, weight=1)
+
+    def _pick_browser(self) -> None:
+        p = filedialog.askopenfilename(parent=self.root, title="選擇 115 瀏覽器（115chrome.exe）",
+                                       filetypes=[("程式", "*.exe"), ("全部", "*.*")])
+        if p:
+            self.settings_vars["browser_path"].set(p)
+
+    def save_settings(self) -> None:
+        s = self.config.settings
+        defaults = Settings()
+        try:
+            for spec in SETTING_FIELDS:
+                name, typ = spec[0], spec[2]
+                var = self.settings_vars[name]
+                if typ == "bool":
+                    val = bool(var.get())
+                elif typ == "lines":
+                    val = [x.strip() for x in var.get("1.0", "end").splitlines() if x.strip()]
+                elif typ == "list":
+                    val = [x.strip() for x in var.get().split(",") if x.strip()]
+                elif typ == "choice":
+                    val = next((k for k, v in spec[3] if v == var.get()), getattr(defaults, name))
+                elif typ == "int":
+                    val = int(var.get())
+                elif typ == "float":
+                    val = float(var.get())
+                else:
+                    val = var.get().strip()
+                setattr(s, name, val)
+        except ValueError as e:
+            messagebox.showerror("設定格式錯誤", f"請檢查數字欄位：{e}", parent=self.root)
+            return
+        self.config.save()
+        if hasattr(self.cloud, "client_id"):
+            self.cloud.client_id = s.client_id
+        if autostart.supported():
+            try:
+                autostart.set_enabled(self.autostart_var.get())
+            except OSError as e:
+                messagebox.showwarning("開機自動啟動", f"設定失敗：{e}", parent=self.root)
+        self._set_status("設定已儲存")
+
+    # ================================================================ 關閉
+    def _on_close(self) -> None:
+        if (self.rt.running or self.busy) and not messagebox.askyesno(
+                "結束程式", "即時同步或工作仍在進行，結束後將停止同步。確定結束？", parent=self.root):
+            return
+        self.engine.cancel_event.set()
+        if self.rt.running:
+            self.rt.stop()
+        self.root.destroy()
+
+
+def review_text(rv) -> str:
+    d = rv.details
+    out = [f"[{KIND_LABELS.get(rv.kind, rv.kind)}]  #{rv.id}", d.get("message", ""), ""]
+    out.append(f"NAS 根目錄：{d.get('local_root', '')}")
+    out.append(f"115 根目錄：{d.get('cloud_root', '')}")
+    loc = d.get("local") or {}
+    if loc:
+        out += ["", "■ NAS 檔案",
+                f"  路徑：{loc.get('path', '')}",
+                f"  大小：{human_size(loc.get('size'))}（{loc.get('size') or 0:,} bytes）"]
+        if loc.get("mtime"):
+            out.append(f"  修改時間：{fmt_time(loc['mtime'])}")
+        if loc.get("md5"):
+            out.append(f"  MD5  ：{loc['md5']}")
+        if loc.get("sha1"):
+            out.append(f"  SHA-1：{loc['sha1']}")
+    for c in d.get("cloud") or []:
+        same = ""
+        if loc.get("sha1") and c.get("sha1"):
+            same = "（與 NAS 相同）" if c["sha1"] == loc["sha1"] else "（與 NAS 不同）"
+        out += ["", "■ 115 檔案",
+                f"  路徑：{c.get('path', '')}",
+                f"  大小：{human_size(c.get('size'))}（{c.get('size') or 0:,} bytes）",
+                f"  SHA-1：{c.get('sha1', '')} {same}",
+                f"  上傳時間：{fmt_time(c.get('mtime'))}",
+                f"  檔案 ID：{c.get('fid', '')}"]
+    matches = d.get("matches") or []
+    if matches:
+        out += ["", f"■ 內容相同的其他檔案（{len(matches)}）"]
+        out += [f"  [{mt.get('where')}] 相同 {mt.get('hash')}：{mt.get('path') or mt.get('rel_path')}"
+                for mt in matches[:50]]
+    if d.get("move_candidate"):
+        out += ["", f"→ 推測是從「{d['move_candidate']['from_rel']}」搬移或改名而來（原位置的 NAS 檔已不存在），"
+                    "可選擇在 115 直接搬移，不必重新上傳。"]
+    if rv.kind == SAVEDATA_GROUP:
+        out += ["", "■ 存檔資料夾",
+                f"  NAS：{d.get('local_dir', '')}",
+                f"  115：{d.get('cloud_dir', '')}",
+                f"  檔案數：{d.get('file_count', 0)}，總大小：{human_size(d.get('total_size'))}", "  檔案："]
+        out += [f"    {p}" for p in d.get("samples", [])]
+        out += ["", "核可後：遊戲寫完存檔（靜置後、遊戲程序結束後）會自動上傳新版並刪除 115 舊版，"
+                    "效果類似 Steam 雲存檔。"]
+    if d.get("paths"):
+        out += ["", f"■ 不見的檔案（{d.get('count', len(d['paths']))}）"]
+        out += [f"  {p}" for p in d["paths"][:100]]
+        if len(d["paths"]) > 100:
+            out.append(f"  …其餘 {len(d['paths']) - 100} 個")
+    out += ["", "說明：SHA-1 相同即內容相同。115 只提供 SHA-1；MD5 由本程式在 NAS 端計算並記錄。"]
+    return "\n".join(out)
+
+
+def run_gui(app: App, start_realtime: bool = False, minimized: bool = False) -> None:
+    enable_dpi_awareness()
+    root = tk.Tk()
+    setup_fonts(root)
+    MainWindow(root, app, start_realtime=start_realtime)
+    if minimized:
+        root.iconify()
+    root.mainloop()

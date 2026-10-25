@@ -1,0 +1,4 @@
+requests>=2.28
+oss2>=2.18
+watchdog>=3.0
+qrcode>=7.4

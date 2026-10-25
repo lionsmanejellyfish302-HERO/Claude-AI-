@@ -87,10 +87,18 @@ def _imports() -> dict:
     import watchdog
     from watchdog.observers import Observer
 
-    return {"requests": requests.__version__, "oss2": oss2.__version__,
-            "watchdog": getattr(watchdog, "__version__", "") or str(getattr(watchdog, "VERSION_STRING", "")),
-            "qrcode": getattr(qrcode, "__version__", ""), "sqlite": sqlite3.sqlite_version,
-            "tk": tkinter.TkVersion, "observer": Observer.__name__}
+    def ver(dist: str) -> str:
+        try:
+            from importlib.metadata import version
+
+            return version(dist)
+        except Exception:  # noqa: BLE001 - 打包後可能沒有套件中繼資料
+            return "ok"
+
+    _ = (qrcode, watchdog)
+    return {"requests": requests.__version__, "oss2": oss2.__version__, "watchdog": ver("watchdog"),
+            "qrcode": ver("qrcode"), "sqlite": sqlite3.sqlite_version, "tk": tkinter.TkVersion,
+            "observer": Observer.__name__}
 
 
 def _qr() -> dict:

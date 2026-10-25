@@ -2,4 +2,4 @@ requests>=2.28
 oss2>=2.18
 watchdog>=3.0
 qrcode>=7.4
-cryptography>=42  # 115 協定的 AES 加解密
+cryptography>=42  # AES for the 115 upload/download protocol

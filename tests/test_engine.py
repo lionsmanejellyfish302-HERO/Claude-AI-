@@ -2,6 +2,7 @@ import os
 import shutil
 
 from nas115sync import compare as C
+from nas115sync.config import TWO_WAY
 from nas115sync.hashing import hash_bytes
 from nas115sync.paths import norm_key
 
@@ -77,7 +78,43 @@ def test_keep_cloud_then_local_edit_syncs(env):
     plans, stats = env.sync()
     assert stats["uploaded"] == 1
     files = env.cloud_files()
-    assert list(files) == ["a.txt"] and files["a.txt"].sha1 == hash_bytes(b"NAS v2").sha1
+    assert files["a.txt"].sha1 == hash_bytes(b"NAS v2").sha1
+    # 「115 version」只存在 115（從未同步到 NAS），不可刪除：改名保留
+    old = [n for n in files if n.startswith("a (115舊版")]
+    assert len(old) == 1 and files[old[0]].sha1 == hash_bytes(b"115 version").sha1
+
+
+def test_keep_cloud_then_cloud_edit_keeps_unique_nas_version(env):
+    env.mapping.direction = TWO_WAY
+    env.config.save()
+    env.write("a.txt", "NAS v1")
+    env.cloud.put_file("/備份/NAS/a.txt", b"115 version")
+    env.sync()
+    [rv] = env.reviews(C.CONFLICT)
+    env.engine.apply_review(rv.id, "keep_cloud")
+    env.sync()
+
+    env.cloud.delete([env.cloud_files()["a.txt"].fid])
+    env.cloud.put_file("/備份/NAS/a.txt", b"115 v2")
+    plans, stats = env.sync()
+    assert stats["downloaded"] == 1
+    assert (env.nas / "a.txt").read_bytes() == b"115 v2"
+    kept = [p for p in env.nas.iterdir() if p.name.startswith("a (NAS舊版")]
+    assert len(kept) == 1 and kept[0].read_bytes() == b"NAS v1"
+
+
+def test_keep_cloud_then_local_delete_needs_review(env):
+    env.write("a.txt", "NAS v1")
+    env.cloud.put_file("/備份/NAS/a.txt", b"115 version")
+    env.sync()
+    [rv] = env.reviews(C.CONFLICT)
+    env.engine.apply_review(rv.id, "keep_cloud")
+    env.sync()
+
+    os.remove(env.nas / "a.txt")
+    env.sync()
+    assert "a.txt" in env.cloud_files()  # 115 上的版本 NAS 從未有過，不自動刪除
+    assert [r.kind for r in env.reviews()] == [C.LOCAL_DELETED]
 
 
 def test_linked_file_modified_replaces_cloud_version(env):

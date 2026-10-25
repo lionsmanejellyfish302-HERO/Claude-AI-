@@ -46,6 +46,11 @@ class _Skipped:
 SKIPPED = _Skipped()
 
 
+def _stamped(name: str, tag: str, i: int = 0) -> str:
+    stem, ext = os.path.splitext(name)
+    return f"{stem} ({tag} {time.strftime('%Y%m%d-%H%M%S')}{f'-{i}' if i else ''}){ext}"
+
+
 def _is_link(entry: os.DirEntry) -> bool:
     try:
         return entry.is_symlink() or bool(getattr(entry, "is_junction", lambda: False)())
@@ -599,9 +604,18 @@ class SyncEngine:
                 raise CloudError(f"驗證失敗：115 上的 SHA-1（{e.sha1}）與 NAS（{lf.sha1}）不符")
         existing = {x.fid for x in self.db.cloud_at(m.id, lf.rel_key)}
         replace = [f for f in t.replace_fids if f != res.fid and f in existing]
-        if replace:
+        if replace and t.keep_old:
+            # 被取代的 115 版本從未出現在 NAS 上：改名保留（下次比對會當成新檔案處理）
+            for i, fid in enumerate(replace):
+                kept = _stamped(name, "115舊版", i)
+                c.rename(fid, kept)
+                self.db.remove_cloud_file(m.id, fid)
+                self.db.add_history(m.id, "keep_old", rel_join(parent_rel, kept), True,
+                                    detail="此版本只存在 115，改名保留")
+        elif replace:
             self._retire_old(m, parent_rel, cid, name, replace, t.savedata_group is not None)
-            try:  # 115 遇到同名檔可能自動改名，刪除舊版後改回原檔名
+        if replace:
+            try:  # 115 遇到同名檔可能自動改名，處理舊版後改回原檔名
                 mine = next((e for e in c.list_dir(cid) if e.fid == res.fid), None)
                 if mine and nfc(mine.name) != nfc(name):
                     c.rename(res.fid, name)
@@ -692,8 +706,10 @@ class SyncEngine:
             log.info("遊戲執行中，延後下載存檔：%s", t.rel_path)
             return SKIPPED
 
+        keep_old = (lambda: self._rename_local_aside(m, t.rel_path)) if t.keep_old else \
+            (lambda: self._trash_local(m, t.rel_path))
         h, how = self.fetch_to(self.cloud_for(m), m.id, t.rel_path, t.fid, t.pick_code, t.sha1, t.size, dest,
-                               keep_old=lambda: self._trash_local(m, t.rel_path))
+                               keep_old=keep_old)
         st = os.stat(lp)
         self.db.put_cached_hash(dest, st.st_mtime_ns, h)
         lf = self._local_row(m, t.rel_path, h, st)
@@ -789,6 +805,20 @@ class SyncEngine:
         os.replace(long_path(local_join(m.local_path, rel_path)), long_path(dest))
         self.db.delete_local(m.id, norm_key(rel_path))
         return dest
+
+    def _rename_local_aside(self, m: Mapping, rel_path: str) -> str:
+        """被取代的 NAS 版本從未出現在 115 上：在原資料夾改名保留（下次比對會當成新檔案處理）。"""
+        parent, name = rel_parent(rel_path), rel_name(rel_path)
+        i = 0
+        while True:
+            new_rel = rel_join(parent, _stamped(name, "NAS舊版", i))
+            if not os.path.exists(long_path(local_join(m.local_path, new_rel))):
+                break
+            i += 1
+        os.replace(long_path(local_join(m.local_path, rel_path)), long_path(local_join(m.local_path, new_rel)))
+        self.db.delete_local(m.id, norm_key(rel_path))
+        self.db.add_history(m.id, "keep_old", new_rel, True, detail="此版本只存在 NAS，改名保留")
+        return new_rel
 
     def purge_local_trash(self, m: Mapping) -> None:
         root = long_path(local_join(m.local_path, self.settings.local_trash_dir))

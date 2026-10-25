@@ -104,6 +104,8 @@ class UploadTask:
     replace_fids: list[str] = field(default_factory=list)
     savedata_group: str | None = None
     size: int = 0
+    # 被取代的 115 版本從未出現在 NAS 上（先前選擇「維持兩邊現狀」）：改名保留，不刪除
+    keep_old: bool = False
 
 
 @dataclass
@@ -118,6 +120,8 @@ class DownloadTask:
     replace_local: bool = False
     expected_local_sha1: str = ""  # 覆蓋前確認 NAS 檔仍是這個內容（避免蓋掉剛改的檔案）
     savedata_group: str | None = None
+    # 被取代的 NAS 版本從未出現在 115 上：在原處改名保留，不移到可復原資料夾
+    keep_old: bool = False
 
 
 @dataclass
@@ -337,12 +341,14 @@ class Planner:
         base_cloud = [c for c in cloud if c.sha1 == state.cloud_sha1]
         local_changed = state.local_sha1 != lf.sha1
         cloud_changed = not base_cloud
+        divergent = state.local_sha1 != state.cloud_sha1  # 基準時兩邊就不同：被取代的一邊是獨一無二的內容
         if not local_changed and not cloud_changed:
             return Outcome("in_sync", local=lf)  # 先前選擇「維持兩邊現狀」
         if local_changed and not cloud_changed:
             if m.can_upload and auto:
                 return Outcome("upload", upload=UploadTask(m.id, lf.rel_path, "savedata" if saved else "modified",
-                                                           [c.fid for c in base_cloud], group, lf.size))
+                                                           [c.fid for c in base_cloud], group, lf.size,
+                                                           keep_old=divergent))
             msg = ("已連結的檔案在 NAS 端被修改（設定為需本人核對）。" if m.can_upload
                    else "此對應為「115 → NAS」，但 NAS 上的檔案在上次同步後被修改。")
             return self._review(CONFLICT, m, lf, msg, cloud)
@@ -352,14 +358,14 @@ class Planner:
                 return Outcome("download", download=DownloadTask(
                     m.id, lf.rel_path, newest.fid, newest.pick_code, newest.sha1, newest.size,
                     "savedata" if saved else "modified", replace_local=True, expected_local_sha1=lf.sha1,
-                    savedata_group=group))
+                    savedata_group=group, keep_old=divergent))
             return self._review(CLOUD_CHANGED, m, lf, "115 上的檔案在上次同步後被修改，NAS 版本未變。", cloud)
         return self._review(CONFLICT, m, lf, "NAS 與 115 兩邊在上次同步後都被修改。", cloud)
 
     def _local_only(self, m, lf, state, group, saved) -> Outcome:
         key = lf.rel_key
         if state:
-            if m.can_download and state.local_sha1 == lf.sha1:
+            if m.can_download and state.local_sha1 == lf.sha1 and state.local_sha1 == state.cloud_sha1:
                 return Outcome("cloud_gone", state=state, local=lf, saved=saved)
             msg = ("上次同步後，115 上的這個檔案已不存在（NAS 版本也被修改過）。" if state.local_sha1 != lf.sha1
                    else "上次同步後，115 上的這個檔案已不存在。")
@@ -390,7 +396,8 @@ class Planner:
         c = cloud[0]
         if state:
             base = [x for x in cloud if x.sha1 == state.cloud_sha1]
-            if base and m.can_upload:
+            # 基準時兩邊不同：115 版本從未出現在 NAS 上，不可自動刪除，交給本人核對
+            if base and m.can_upload and state.local_sha1 == state.cloud_sha1:
                 return Outcome("local_gone", state=state, base=base, saved=saved)
             msg = ("NAS 上的檔案已刪除，115 上的版本也在上次同步後被修改。" if not base
                    else "NAS 上的檔案已刪除（此對應為「115 → NAS」）。")

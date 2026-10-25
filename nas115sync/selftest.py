@@ -58,7 +58,7 @@ def run(out_dir: str, gui: bool = True, tab_seconds: float = 0.0) -> int:
         step("手動上傳／下載與資源回收筒", lambda: _manual(home, ctx))
         step("程序偵測與開機啟動指令", _system)
         if gui:
-            step("圖形介面（所有分頁）", lambda: _gui(ctx, out_dir, tab_seconds))
+            step("圖形介面（所有分頁與按鈕）", lambda: _gui(ctx, out_dir, tab_seconds))
     finally:
         app = ctx.get("app")
         if app is not None:
@@ -250,6 +250,8 @@ def _gui(ctx: dict, out_dir: str, tab_seconds: float) -> dict:
     root = tk.Tk()
     setup_fonts(root)
     apply_window_icon(root)
+    from .gui import exercise
+
     win = MainWindow(root, ctx["app"])
     titles = []
     try:
@@ -265,8 +267,12 @@ def _gui(ctx: dict, out_dir: str, tab_seconds: float) -> dict:
                 while time.time() < end:
                     root.update()
                     time.sleep(0.05)
+        _check(len(titles) >= 9, f"分頁數量不對：{titles}")
+        # 依序按下每個分頁的每個按鈕（對話框自動回答），全程不可出現錯誤
+        result = exercise.run(win, os.path.join(os.path.dirname(ctx["nas"]), "介面演練"))
     finally:
         win.scheduler.stop()
+        if win.rt.running:
+            win.rt.stop()
         root.destroy()
-    _check(len(titles) >= 9, f"分頁數量不對：{titles}")
-    return {"tabs": titles}
+    return {"tabs": titles, "exercise": [f"{s['name']}（{s['seconds']} 秒）" for s in result["steps"]]}

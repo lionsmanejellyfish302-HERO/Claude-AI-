@@ -102,8 +102,8 @@ class MainWindow:
         self.statusbar = ttk.Label(root, text="就緒", anchor="w", padding=(10, 4))
         self.statusbar.pack(fill="x")
 
-        handler = QueueLogHandler(self.ui, self._append_log)
-        logging.getLogger().addHandler(handler)
+        self._log_handler = QueueLogHandler(self.ui, self._append_log)
+        logging.getLogger().addHandler(self._log_handler)
         self.engine.listeners.append(lambda ev, data: self.ui.call(self._on_engine_event, ev, data))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -144,22 +144,28 @@ class MainWindow:
         self.cancel_btn.configure(state="normal")
 
         def target():
+            res, done, status = None, None, f"{title}失敗"
             try:
                 res = fn()
-                if on_done:
-                    self.ui.call(on_done, res)
-                self.ui.call(self._set_status, f"{title}完成")
+                done, status = on_done, f"{title}完成"
             except Cancelled:
-                self.ui.call(self._set_status, f"{title}已取消")
+                status = f"{title}已取消"
             except Exception as e:  # noqa: BLE001
                 log.exception("%s失敗", title)
+                status = f"{title}失敗：{e}"
                 self.ui.call(messagebox.showerror, f"{title}失敗", str(e))
-                self.ui.call(self._set_status, f"{title}失敗：{e}")
             finally:
                 self.engine.cancel_event.clear()  # 取消只針對這個工作，不影響即時同步
-                self.ui.call(self._idle)
+                self.ui.call(self._finish, status, done, res)
 
         threading.Thread(target=target, daemon=True).start()
+
+    def _finish(self, status: str, on_done, res) -> None:
+        # 先結束「工作中」狀態，on_done 才能接著開始下一個工作（例如比對完重新整理）
+        self._idle()
+        self._set_status(status)
+        if on_done:
+            on_done(res)
 
     def _idle(self) -> None:
         self.busy = False
@@ -1101,6 +1107,7 @@ class MainWindow:
         self.scheduler.stop()
         if self.rt.running:
             self.rt.stop()
+        logging.getLogger().removeHandler(self._log_handler)
         self.root.destroy()
 
 

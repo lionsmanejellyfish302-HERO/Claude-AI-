@@ -5,7 +5,7 @@
 # 用法：pyinstaller --noconfirm NAS115Sync.spec
 from PyInstaller.utils.hooks import collect_submodules
 
-hidden = collect_submodules("watchdog") + collect_submodules("oss2")
+hidden = collect_submodules("watchdog") + collect_submodules("oss2") + collect_submodules("nas115sync")
 
 a = Analysis(
     ["NAS115Sync.pyw"],

@@ -35,6 +35,13 @@ class _Dialog(tk.Toplevel):
         self.wait_window()
         return self.result
 
+    def destroy(self):
+        super().destroy()
+        # 立即在主執行緒釋放 Tk 變數：否則之後可能由背景執行緒的垃圾回收釋放，而 Tk 不允許跨執行緒呼叫
+        for name, value in list(vars(self).items()):
+            if isinstance(value, tk.Variable):
+                delattr(self, name)
+
 
 class AddMappingDialog(_Dialog):
     """新增或編輯路徑對應：路徑、同步方向、刪除處理、帳號、篩選。"""

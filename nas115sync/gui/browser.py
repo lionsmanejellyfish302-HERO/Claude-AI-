@@ -67,7 +67,7 @@ class BrowserTab:
 
     def set_initial_local(self, path: str) -> None:
         if path and not self.local_dir:
-            self.local_go(path)
+            self.local_go(path, quiet=True)  # 程式啟動時 NAS 可能尚未連線，不跳出錯誤視窗
 
     def local_pick(self) -> None:
         d = filedialog.askdirectory(parent=self.win.root, title="選擇 NAS 資料夾")
@@ -80,7 +80,7 @@ class BrowserTab:
             if parent and parent != self.local_dir:
                 self.local_go(parent)
 
-    def local_go(self, path: str) -> None:
+    def local_go(self, path: str, quiet: bool = False) -> None:
         path = path.strip()
         if not path:
             return
@@ -88,7 +88,11 @@ class BrowserTab:
             with os.scandir(path) as it:
                 entries = sorted(it, key=lambda e: (not e.is_dir(), name_key(e.name)))
         except OSError as e:
-            messagebox.showerror("無法開啟", str(e), parent=self.win.root)
+            if quiet:
+                self.local_var.set(path)
+                self.win.set_status(f"無法開啟 NAS 資料夾（可能尚未連線）：{e}")
+            else:
+                messagebox.showerror("無法開啟", str(e), parent=self.win.root)
             return
         self.local_dir = path
         self.local_var.set(path)
@@ -120,7 +124,10 @@ class BrowserTab:
             return
         name = simpledialog.askstring("新資料夾", "資料夾名稱：", parent=self.win.root)
         if name:
-            os.makedirs(os.path.join(self.local_dir, name), exist_ok=True)
+            try:
+                os.makedirs(os.path.join(self.local_dir, name.strip()), exist_ok=True)
+            except OSError as e:
+                messagebox.showerror("無法建立資料夾", str(e), parent=self.win.root)
             self.local_go(self.local_dir)
 
     def local_rename(self) -> None:
@@ -128,8 +135,14 @@ class BrowserTab:
         if len(sel) != 1:
             return
         new = simpledialog.askstring("重新命名", "新名稱：", initialvalue=os.path.basename(sel[0]), parent=self.win.root)
-        if new and new != os.path.basename(sel[0]):
-            os.rename(sel[0], os.path.join(self.local_dir, new))
+        if new and new.strip() and new != os.path.basename(sel[0]):
+            dest = os.path.join(self.local_dir, new.strip())
+            try:
+                if os.path.exists(dest) and os.path.normcase(dest) != os.path.normcase(sel[0]):
+                    raise OSError(f"已有同名項目：{new.strip()}")
+                os.rename(sel[0], dest)
+            except OSError as e:
+                messagebox.showerror("無法重新命名", str(e), parent=self.win.root)
             self.local_go(self.local_dir)
 
     def local_delete(self) -> None:
@@ -225,9 +238,9 @@ class BrowserTab:
 
     def cloud_go_path(self, path: str) -> None:
         path = cloud_norm(path)
+        c = self.client  # 背景執行緒不能讀取 Tk 元件，先在主執行緒取得
 
         def work():
-            c = self.client
             stack, cid = [(c.root_cid, "")], c.root_cid
             for part in [p for p in path.split("/") if p]:
                 child = c.find_child(cid, part, want_dir=True)
@@ -240,14 +253,14 @@ class BrowserTab:
         self._bg(work, lambda r: self._show_cloud(*r), "讀取中…")
 
     def cloud_refresh(self) -> None:
-        stack = list(self.cloud_stack)
-        self._bg(lambda: self.client.list_dir(stack[-1][0]), lambda entries: self._show_cloud(stack, entries),
+        stack, c = list(self.cloud_stack), self.client
+        self._bg(lambda: c.list_dir(stack[-1][0]), lambda entries: self._show_cloud(stack, entries),
                  "讀取中…")
 
     def cloud_up(self) -> None:
         if len(self.cloud_stack) > 1:
-            stack = self.cloud_stack[:-1]
-            self._bg(lambda: self.client.list_dir(stack[-1][0]), lambda e: self._show_cloud(stack, e), "讀取中…")
+            stack, c = self.cloud_stack[:-1], self.client
+            self._bg(lambda: c.list_dir(stack[-1][0]), lambda e: self._show_cloud(stack, e), "讀取中…")
 
     def _show_cloud(self, stack, entries, title: str | None = None) -> None:
         self.cloud_stack = stack
@@ -270,19 +283,20 @@ class BrowserTab:
         e = self.cloud_items.get(sel[0])
         if e is None:
             return
+        c = self.client
         if e.is_dir:
             stack = self.cloud_stack + [(e.fid, e.name)]
-            self._bg(lambda: self.client.list_dir(e.fid), lambda entries: self._show_cloud(stack, entries), "讀取中…")
+            self._bg(lambda: c.list_dir(e.fid), lambda entries: self._show_cloud(stack, entries), "讀取中…")
         elif e.pid and e.pid != self.cid:  # 搜尋結果：跳到所在資料夾
-            stack = [(self.client.root_cid, ""), (e.pid, f"（資料夾 ID {e.pid}）")]
-            self._bg(lambda: self.client.list_dir(e.pid), lambda entries: self._show_cloud(stack, entries), "讀取中…")
+            stack = [(c.root_cid, ""), (e.pid, f"（資料夾 ID {e.pid}）")]
+            self._bg(lambda: c.list_dir(e.pid), lambda entries: self._show_cloud(stack, entries), "讀取中…")
 
     def cloud_search(self) -> None:
         kw = self.search_var.get().strip()
         if not kw:
             return
-        cid = self.cid
-        self._bg(lambda: self.client.search(kw, cid),
+        cid, c = self.cid, self.client
+        self._bg(lambda: c.search(kw, cid),
                  lambda res: self._show_cloud(self.cloud_stack, res, f"搜尋「{kw}」：{len(res)} 筆"), "搜尋中…")
 
     def _cloud_selected(self) -> list[CloudEntry]:
@@ -291,8 +305,8 @@ class BrowserTab:
     def cloud_mkdir(self) -> None:
         name = simpledialog.askstring("新資料夾", "115 資料夾名稱：", parent=self.win.root)
         if name:
-            cid = self.cid
-            self._bg(lambda: self.client.ensure_child_dir(cid, name), lambda _: self.cloud_refresh())
+            cid, c = self.cid, self.client
+            self._bg(lambda: c.ensure_child_dir(cid, name), lambda _: self.cloud_refresh())
 
     def cloud_rename(self) -> None:
         sel = self._cloud_selected()
@@ -300,14 +314,15 @@ class BrowserTab:
             return
         new = simpledialog.askstring("重新命名", "新名稱：", initialvalue=sel[0].name, parent=self.win.root)
         if new and new != sel[0].name:
-            self._bg(lambda: self.client.rename(sel[0].fid, new), lambda _: self.cloud_refresh())
+            c = self.client
+            self._bg(lambda: c.rename(sel[0].fid, new), lambda _: self.cloud_refresh())
 
     def cloud_delete(self) -> None:
         sel = self._cloud_selected()
         if sel and messagebox.askyesno("刪除", f"刪除 115 上 {len(sel)} 個項目？（會進入 115 回收站）",
                                        parent=self.win.root):
-            cid = self.cid
-            self._bg(lambda: self.client.delete([e.fid for e in sel], cid), lambda _: self.cloud_refresh())
+            cid, c = self.cid, self.client
+            self._bg(lambda: c.delete([e.fid for e in sel], cid), lambda _: self.cloud_refresh())
 
     def cloud_move(self) -> None:
         sel = self._cloud_selected()
@@ -316,9 +331,9 @@ class BrowserTab:
         dest = simpledialog.askstring("移動到", "目的 115 資料夾路徑（例如 /備份/整理）：", parent=self.win.root)
         if not dest:
             return
+        c = self.client
 
         def work():
-            c = self.client
             to = c.ensure_path(dest)
             c.move([e.fid for e in sel], to)
 

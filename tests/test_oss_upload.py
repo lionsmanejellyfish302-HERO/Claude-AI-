@@ -117,3 +117,53 @@ def test_cancel_stops_upload(tmp_path, monkeypatch):
     mgr.cancel(ctrl.t.id)
     with pytest.raises(Cancelled):
         oss_upload.upload_to_oss(str(f), 2500, token, "fhnfile", "obj", "{}", "", 1000, ctrl)
+
+
+def test_network_errors_are_retried_with_fresh_credentials(tmp_path, monkeypatch):
+    """網路中斷或 OSS 暫時錯誤：等一下用新的上傳憑證重試同一個分片，不必整個重來。"""
+    failures = {2: [oss2.exceptions.RequestError(ConnectionResetError("reset")), OSError("NAS 讀取逾時")]}
+
+    class FlakyBucket(FakeBucket):
+        def upload_part(self, key, upload_id, n, data, progress_callback=None):
+            if failures.get(n):
+                raise failures[n].pop(0)
+            return super().upload_part(key, upload_id, n, data, progress_callback)
+
+    monkeypatch.setattr(oss2, "Bucket", FlakyBucket)
+    monkeypatch.setattr(oss_upload.time, "sleep", lambda s: None)
+    tokens, first = [], len(FakeBucket.instances)
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"y" * 2500)
+    body = oss_upload.upload_to_oss(str(f), 2500, lambda: tokens.append(1) or token(), "fhnfile", "obj", "{}", "",
+                                    1000)
+    assert sorted(n for b in FakeBucket.instances[first:] for n, _size in b.parts) == [1, 2, 3]
+    assert len(tokens) == 3 and body["data"]["file_id"] == "F2"  # 每次重試都換新憑證
+
+
+def test_gives_up_after_repeated_failures(tmp_path, monkeypatch):
+    class DownBucket(FakeBucket):
+        def put_object(self, *a, **kw):
+            raise OSError("網路中斷")
+
+    monkeypatch.setattr(oss2, "Bucket", DownBucket)
+    monkeypatch.setattr(oss_upload.time, "sleep", lambda s: None)
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"x" * 100)
+    with pytest.raises(oss_upload.CloudError):
+        oss_upload.upload_to_oss(str(f), 100, token, "fhnfile", "obj", "{}", "", 1024)
+
+
+def test_expired_resume_id_restarts_upload(tmp_path, monkeypatch):
+    """保存的分片上傳 ID 已過期（OSS 回 NoSuchUpload）：改為重新上傳，並保存新的 ID。"""
+    class ExpiredBucket(FakeBucket):
+        def list_parts(self, key, upload_id, marker="", max_parts=1000, headers=None):
+            raise oss2.exceptions.NoSuchUpload(404, {}, b"", {"Code": "NoSuchUpload"})
+
+    monkeypatch.setattr(oss2, "Bucket", ExpiredBucket)
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"z" * 2500)
+    ids = []
+    oss_upload.upload_to_oss(str(f), 2500, token, "fhnfile", "obj", "{}", "", 1000, upload_id="OLD",
+                             on_upload_id=ids.append)
+    b = FakeBucket.instances[-1]
+    assert ids == ["UP1"] and b.parts == [(1, 1000), (2, 1000), (3, 500)] and b.completed[0] == [1, 2, 3]

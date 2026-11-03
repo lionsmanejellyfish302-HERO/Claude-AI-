@@ -270,6 +270,23 @@ def test_second_account(env):
         env.config.remove_account(acc.id)
 
 
+def test_remove_account_deletes_stored_login(env, tmp_path):
+    from nas115sync.cloud.tokens import TokenStore
+    from nas115sync.cloud.web115 import Web115Client
+
+    acc = env.config.add_account("家人帳號")
+    login_file = tmp_path / f"login115_{acc.id}.dat"
+    TokenStore(login_file).save({"cookies": {"UID": "1_A1_2", "CID": "c", "SEID": "s"}})
+    env.engine.clouds[acc.id] = Web115Client(TokenStore(login_file))
+    env.engine.remove_account(acc.id)
+    assert not login_file.exists() and acc.id not in env.engine.clouds  # 刪除帳號時登入資訊一併刪除
+    assert acc.id not in [a.id for a in env.config.accounts]
+    with pytest.raises(ValueError):
+        env.engine.remove_account("不存在的帳號")
+    with pytest.raises(ValueError):
+        env.engine.remove_account("default")
+
+
 def test_transfer_queue_records_uploads(env):
     env.write("a.bin", os.urandom(50_000))
     env.sync()

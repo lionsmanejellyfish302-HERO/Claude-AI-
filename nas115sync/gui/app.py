@@ -420,11 +420,10 @@ class MainWindow:
         if not messagebox.askyesno("刪除帳號", f"刪除帳號「{self.acct_combo.get()}」？", parent=self.root):
             return
         try:
-            self.config.remove_account(aid)
+            self.engine.remove_account(aid)
         except ValueError as e:
             messagebox.showerror("無法刪除", str(e), parent=self.root)
             return
-        self.engine.clouds.pop(aid, None)
         self._fill_accounts()
         self.browser.refresh_accounts()
         self._refresh_account()

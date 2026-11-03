@@ -233,6 +233,8 @@ class Config:
     def remove_account(self, account_id: str) -> None:
         if account_id == "default":
             raise ValueError("預設帳號不能刪除")
+        if not any(a.id == account_id for a in self.accounts):
+            raise ValueError(f"找不到帳號：{account_id}")
         if any(m.account_id == account_id for m in self.mappings):
             raise ValueError("仍有路徑對應使用此帳號")
         with self._lock:

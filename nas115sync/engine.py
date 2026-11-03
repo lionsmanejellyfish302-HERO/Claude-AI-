@@ -112,6 +112,13 @@ class SyncEngine:
     def cloud_for(self, m: Mapping) -> CloudClient:
         return self.client(m.account_id)
 
+    def remove_account(self, account_id: str) -> None:
+        """刪除帳號，並一併刪除此帳號保存在本機的 115 登入資訊。"""
+        self.config.remove_account(account_id)
+        logout = getattr(self.clouds.pop(account_id, None), "logout", None)
+        if logout:
+            logout()
+
     def planner(self) -> Planner:
         p = Planner(self.db, self.settings)
         p.set_roots(self.config.mappings)

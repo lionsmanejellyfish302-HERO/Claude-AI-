@@ -35,6 +35,59 @@ def test_every_gui_button_works(tmp_path, monkeypatch):
         gc.collect()  # 在主執行緒釋放視窗物件（Tk 不允許其他執行緒釋放）
 
 
+def test_qr_login_dialog_flow():
+    """115 掃碼登入：畫出白底 QR 碼 → 等待掃描 → 手機確認後完成登入並關閉對話框。"""
+    import threading
+    import time
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("沒有圖形顯示環境")
+    from nas115sync.cloud.web115 import QR_CONFIRMED, QR_SCANNED, QR_WAITING, QrLogin
+    from nas115sync.gui import theme
+    from nas115sync.gui.dialogs import QrLoginDialog
+    from nas115sync.gui.util import UiQueue
+
+    class QrCloud:
+        device = "alipaymini"
+        finished = started = None
+
+        def __init__(self):
+            self.go = threading.Event()
+            self.states = [QR_SCANNED, QR_CONFIRMED]
+
+        def start_qr_login(self, device=None):
+            self.started = device
+            return QrLogin("1", 0, "s", "https://115.com/scan/dg-1", device)
+
+        def poll_qr_status(self, login):
+            return self.states.pop(0) if self.go.wait(0.05) else QR_WAITING
+
+        def finish_qr_login(self, login):
+            self.finished = login
+
+    def pump(cond):
+        end = time.monotonic() + 10
+        while not cond() and time.monotonic() < end:
+            root.update()
+            time.sleep(0.01)
+        return cond()
+
+    try:
+        theme.build(root, "dark")
+        cloud = QrCloud()
+        dlg = QrLoginDialog(root, cloud, UiQueue(root))
+        dlg.start()
+        assert pump(lambda: len(dlg.canvas.find_all()) > 100), "沒有畫出 QR 碼"
+        assert dlg.canvas.cget("bg") == "white" and cloud.started == "alipaymini"  # 深色模式也是白底
+        cloud.go.set()
+        assert pump(lambda: not dlg.winfo_exists()), "確認後對話框沒有關閉"
+        assert dlg.result is True and cloud.finished.uid == "1"
+    finally:
+        root.destroy()
+
+
 def _alive(root) -> bool:
     try:
         return bool(root.winfo_exists())

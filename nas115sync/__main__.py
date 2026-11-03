@@ -118,8 +118,8 @@ def cmd_accounts(app, args) -> int:
         app.engine.clouds[a.id] = make_client(cfg, a.id, app.demo)
         print(f"已新增帳號 {a.id}（{a.label}），請執行：login --account {a.id}")
     elif args.action == "remove":
-        cfg.remove_account(args.id)
-        print("已刪除帳號")
+        app.engine.remove_account(args.id)
+        print("已刪除帳號（本機保存的登入資訊也已刪除）")
     else:
         for a in cfg.accounts:
             used = sum(m.account_id == a.id for m in cfg.mappings)

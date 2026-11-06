@@ -9,8 +9,9 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Node 24 版本的官方 actions（Node 20 已停用）
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install
@@ -76,14 +77,18 @@ jobs:
           Run --demo schedule add 03:00 --days "0,2,4"
           Run --demo schedule add 04:30 --days 5 6
 
-      - uses: actions/upload-artifact@v4
+      # 兩個 exe 各自上傳、不壓縮：在 Artifacts 點一下就是 exe 本身，不用再解壓縮
+      - uses: actions/upload-artifact@v7
         with:
-          name: NAS115Sync-windows-exe
-          path: |
-            dist/NAS115Sync.exe
-            dist/NAS115Sync-CLI.exe
+          path: dist/NAS115Sync.exe
+          archive: false
           retention-days: 90
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/NAS115Sync-CLI.exe
+          archive: false
+          retention-days: 90
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: selftest-report-and-screenshots

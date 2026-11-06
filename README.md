@@ -110,7 +110,7 @@
 | `NAS115Sync-CLI.exe` | 指令列（排程、批次、Windows 工作排程器用），指令與下方「指令列」一節相同 |
 
 1. 取得 exe：
-   - GitHub → 此專案 → **Actions** → 最新一次「Windows build & test」→ 下方 **Artifacts** 下載 `NAS115Sync-windows-exe`（需登入 GitHub，保留 90 天）；或
+   - GitHub → 此專案 → **Actions** → 最新一次「Windows build & test」→ 下方 **Artifacts** 直接點 `NAS115Sync.exe`、`NAS115Sync-CLI.exe` 下載（就是 exe 本身，不用解壓縮；需登入 GitHub，保留 90 天）；或
    - 自行打包：安裝 Python 後雙擊 **`build_exe.bat`**，會產生 `dist\NAS115Sync.exe`、`dist\NAS115Sync-CLI.exe` 並自動做一次自我測試。
 2. 把兩個 exe 放到固定的資料夾（例如 `C:\NAS115Sync\`，不要放在「下載」或暫存資料夾，因為開機自動啟動會記住這個位置）。
 3. 第一次開啟若出現 **「Windows 已保護您的電腦」**（SmartScreen，因為程式沒有付費數位簽章）：按 **「其他資訊」→「仍要執行」**。

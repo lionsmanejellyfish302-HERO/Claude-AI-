@@ -20,12 +20,34 @@ def new_schedule(time_hhmm: str = "03:00", days=None, action: str = "sync", mapp
             "mapping_ids": list(mapping_ids or [])}
 
 
-def describe(s: dict) -> str:
+def describe_when(s: dict) -> str:
     days = s.get("days", [])
     when = "每天" if len(days) == 7 else "每週" + "、".join(WEEKDAYS[d] for d in sorted(days))
+    return f"{when} {s.get('time')}"
+
+
+def describe(s: dict) -> str:
     what = "完整比對＋同步" if s.get("action") == "sync" else "只比對"
     scope = f"{len(s['mapping_ids'])} 個對應" if s.get("mapping_ids") else "所有對應"
-    return f"{when} {s.get('time')} {what}（{scope}）{'' if s.get('enabled', True) else '［停用］'}"
+    return f"{describe_when(s)} {what}（{scope}）{'' if s.get('enabled', True) else '［停用］'}"
+
+
+def next_run(s: dict, now: float | None = None) -> float | None:
+    """下一次執行的時間（停用或沒有勾選任何星期時為 None）。"""
+    if not s.get("enabled", True) or not s.get("days"):
+        return None
+    try:
+        hh, mm = (int(x) for x in str(s.get("time", "")).split(":"))
+    except ValueError:
+        return None
+    now = time.time() if now is None else now
+    base = time.localtime(now)
+    for add in range(8):
+        day = time.localtime(time.mktime((base.tm_year, base.tm_mon, base.tm_mday + add, hh, mm, 0, 0, 0, -1)))
+        ts = time.mktime(day)
+        if ts > now and day.tm_wday in s["days"]:
+            return ts
+    return None
 
 
 class Scheduler:
@@ -75,9 +97,30 @@ class Scheduler:
             plans = eng.analyze(ms)
             stats = eng.execute(plans) if s.get("action") == "sync" else None
             eng.db.add_history("", "schedule", describe(s), True, detail=str(stats or "只比對"))
+            self._record(s, True, _report(plans, stats))
             eng.emit("schedule_done", schedule=s, stats=stats)
             return stats
         except Exception as e:  # noqa: BLE001
             log.exception("排程失敗：%s", describe(s))
             eng.db.add_history("", "schedule", describe(s), False, detail=str(e)[:500])
+            self._record(s, False, f"失敗：{e}"[:500])
             return None
+
+    def _record(self, s: dict, ok: bool, report: str) -> None:
+        """把上次執行的時間與結果記在排程上（「排程」頁的「上次執行」與報告）。"""
+        s["last_run"], s["last_ok"], s["last_report"] = time.time(), ok, report
+        try:
+            if any(x is s for x in self.engine.settings.schedules):
+                self.engine.config.save()
+        except OSError:
+            log.debug("無法保存排程的執行結果", exc_info=True)
+
+
+def _report(plans, stats) -> str:
+    up = sum(len(p.uploads) for p in plans)
+    down = sum(len(p.downloads) for p in plans)
+    rev = sum(len(p.reviews) for p in plans)
+    if stats is None:
+        return f"只比對：待上傳 {up}、待下載 {down}、待核對 {rev}"
+    return (f"上傳 {stats.get('uploaded', 0)}（秒傳 {stats.get('instant', 0)}）、下載 {stats.get('downloaded', 0)}、"
+            f"失敗 {stats.get('failed', 0)}、待核對 {rev}")

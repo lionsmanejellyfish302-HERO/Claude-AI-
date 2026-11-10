@@ -211,6 +211,13 @@ class Database:
         )
         return [LocalRow(**dict(r)) for r in rows]
 
+    def search_local(self, keyword: str, limit: int = 500) -> list[LocalRow]:
+        """在已建立索引的 NAS 檔案中依檔名（含路徑）搜尋，不必重新掃描 NAS。"""
+        like = "%" + norm_key(keyword).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self._all("SELECT * FROM local_files WHERE rel_key LIKE ? ESCAPE '\\' ORDER BY rel_key LIMIT ?",
+                         (like, limit))
+        return [LocalRow(**dict(r)) for r in rows]
+
     def local_under(self, mapping_id: str, rel_dir: str) -> list[LocalRow]:
         sql, args = _under("SELECT * FROM local_files WHERE mapping_id=?", mapping_id, rel_dir)
         return [LocalRow(**dict(r)) for r in self._all(sql, args)]

@@ -14,7 +14,7 @@ def test_upload_paths_folder_with_instant_and_conflicts(env, tmp_path):
     env.cloud.known_sha1.add(hash_bytes(b"A").sha1)
     target = env.cloud.ensure_path("/手動")
     stats = manual.upload_paths(env.engine, "default", [str(src)], target)
-    assert stats == {"instant": 1, "uploaded": 1, "skipped": 0, "failed": 0}
+    assert stats == {"instant": 1, "uploaded": 1, "skipped": 0, "failed": 0, "not_instant": 0}
     assert set(env.cloud.files_in("/手動/src")) == {"a.txt"}
     assert set(env.cloud.files_in("/手動/src/sub")) == {"b.txt"}
 
@@ -98,3 +98,69 @@ def test_recycle_bin(tmp_path):
     f.write_text("bye")
     manual.send_to_recycle_bin(str(f))
     assert not f.exists()
+
+
+def test_upload_instant_only_never_uploads_real_data(env, tmp_path):
+    """只秒傳：115 上已有相同內容的檔案秒傳，其餘的不上傳、也不算失敗。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "known.bin").write_bytes(b"already on 115")
+    (src / "new.bin").write_bytes(b"only on NAS")
+    env.cloud.known_sha1.add(hash_bytes(b"already on 115").sha1)
+    target = env.cloud.ensure_path("/只秒傳")
+    stats = manual.upload_paths(env.engine, "default", [str(src / "known.bin"), str(src / "new.bin")], target,
+                                instant_only=True)
+    assert stats == {"instant": 1, "uploaded": 0, "skipped": 0, "failed": 0, "not_instant": 1}
+    assert set(env.cloud.files_in("/只秒傳")) == {"known.bin"} and env.cloud.real_upload_count == 0
+
+
+def test_copy_local_folders_and_conflicts(env, tmp_path):
+    src, dest = tmp_path / "來源", tmp_path / "目的"
+    (src / "子").mkdir(parents=True)
+    dest.mkdir()
+    (src / "a.txt").write_text("A")
+    (src / "子" / "b.txt").write_text("B")
+    stats = manual.copy_local(env.engine, [str(src)], str(dest))
+    assert stats == {"copied": 2, "skipped": 0, "failed": 0}
+    assert (dest / "來源" / "子" / "b.txt").read_text() == "B" and (src / "a.txt").exists()
+    # 再複製一次：內容相同的略過
+    assert manual.copy_local(env.engine, [str(src)], str(dest))["skipped"] == 2
+    # 同名不同內容：保留兩者／略過／覆蓋（舊檔進資源回收筒）
+    (src / "a.txt").write_text("A2")
+    manual.copy_local(env.engine, [str(src / "a.txt")], str(dest / "來源"), conflict=manual.KEEP_BOTH)
+    names = sorted(p.name for p in (dest / "來源").iterdir() if p.is_file())
+    assert len(names) == 2 and (dest / "來源" / "a.txt").read_text() == "A"
+    assert manual.copy_local(env.engine, [str(src / "a.txt")], str(dest / "來源"), conflict=manual.SKIP) == {
+        "copied": 0, "skipped": 1, "failed": 0}
+    manual.copy_local(env.engine, [str(src / "a.txt")], str(dest / "來源"), conflict=manual.OVERWRITE)
+    assert (dest / "來源" / "a.txt").read_text() == "A2"
+    # 不能把資料夾複製到它自己裡面
+    assert manual.copy_local(env.engine, [str(src)], str(src / "子"))["failed"] == 1
+    assert any(t["kind"] == "copy" and t["status"] == "done" for t in env.engine.transfers.snapshot())
+
+
+def test_move_local(env, tmp_path):
+    src, dest = tmp_path / "來源", tmp_path / "目的"
+    (src / "子").mkdir(parents=True)
+    dest.mkdir()
+    (src / "a.txt").write_text("A")
+    (src / "子" / "b.txt").write_text("B")
+    stats = manual.copy_local(env.engine, [str(src)], str(dest), move=True)
+    assert stats == {"copied": 2, "skipped": 0, "failed": 0}
+    assert (dest / "來源" / "子" / "b.txt").read_text() == "B" and not src.exists()
+
+
+def test_transfer_between_two_115_accounts(env, tmp_path):
+    from nas115sync.cloud.fake import FakeCloud
+
+    other = FakeCloud()
+    env.engine.clouds["other"] = other
+    env.cloud.put_file("/來源/資料夾/a.txt", b"AAA")
+    env.cloud.put_file("/來源/b.txt", b"BBB")
+    other.known_sha1.add(hash_bytes(b"AAA").sha1)  # 另一個帳號的 115 上已有相同內容：秒傳
+    items = env.cloud.list_dir(env.cloud.resolve_path("/來源"))
+    stats = manual.transfer_between_accounts(env.engine, "default", items, "other", other.ensure_path("/收"),
+                                             work_dir=str(tmp_path))
+    assert stats == {"instant": 1, "uploaded": 1, "skipped": 0, "failed": 0}
+    assert set(other.files_in("/收")) == {"b.txt"} and set(other.files_in("/收/資料夾")) == {"a.txt"}
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith("nas115sync_transfer_")]  # 暫存已清除

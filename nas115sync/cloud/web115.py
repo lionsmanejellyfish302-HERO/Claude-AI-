@@ -110,6 +110,16 @@ def _first(d):
     return d if isinstance(d, dict) else {}
 
 
+def _size(v) -> int:
+    """容量欄位可能是數字、數字字串，或 {"size": 數字} 。"""
+    if isinstance(v, dict):
+        v = v.get("size")
+    try:
+        return max(0, int(float(v)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_entry(it: dict) -> CloudEntry:
     """webapi 的檔案資料：資料夾有 cid（自己）與 pid（上層）；檔案有 fid（自己）與 cid（上層）。"""
     if "file_category" in it:
@@ -369,6 +379,36 @@ class Web115Client(CloudClient):
             data = {f"fid[{i}]": f for i, f in enumerate(fids)}
             data["pid"] = to_cid
             self._call("POST", f"{WEBAPI}/files/move", data=data)
+
+    def copy(self, fids: list[str], to_cid: str) -> None:
+        if fids:
+            data = {f"fid[{i}]": f for i, f in enumerate(fids)}
+            data["pid"] = to_cid
+            self._call("POST", f"{WEBAPI}/files/copy", data=data)
+
+    def space_info(self) -> tuple[int, int] | None:
+        """115 的容量資訊；格式不如預期或查詢失敗時回傳 None（只是顯示用，不影響其他功能）。"""
+        try:
+            j = self._call("GET", f"{WEBAPI}/files/index_info")
+        except CloudError as e:
+            log.debug("查詢 115 容量失敗：%s", e)
+            return None
+        info = _first(j.get("data")).get("space_info")
+        if not isinstance(info, dict):
+            return None
+        total, used = _size(info.get("all_total")), _size(info.get("all_use"))
+        return (total, min(used, total)) if total > 0 else None
+
+    def path_of(self, cid: str) -> list[tuple[str, str]] | None:
+        if str(cid) == self.root_cid:
+            return []
+        j = self._call("GET", f"{WEBAPI}/files", params={
+            "aid": 1, "cid": cid, "offset": 0, "limit": 1, "show_dir": 1, "cur": 1, "format": "json"})
+        if "cid" in j and str(j.get("cid")) != str(cid):
+            raise NotFoundError(f"115 資料夾不存在（cid={cid}）")
+        out = [(str(p.get("cid")), nfc(str(p.get("name") or ""))) for p in (j.get("path") or [])
+               if isinstance(p, dict) and str(p.get("cid") or "0") != "0"]
+        return out if out and out[-1][0] == str(cid) else None
 
     def search(self, keyword: str, cid: str = "0", limit: int = 500) -> list[CloudEntry]:
         out: list[CloudEntry] = []

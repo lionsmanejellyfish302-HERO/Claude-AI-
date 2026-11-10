@@ -14,7 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .cloud.base import CloudClient, CloudEntry
 from .compare import KIND_LABELS, Plan
-from .paths import cloud_join, local_join, long_path, name_key, norm_key, rel_join, rel_name, unsafe_name
+from .paths import (cloud_join, is_inside, local_join, long_path, name_key, norm_key, rel_join, rel_name,
+                    unsafe_name)
+from .transfers import Cancelled
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +30,14 @@ def _stamped(name: str, tag: str) -> str:
 
 
 # ---------------------------------------------------------------- 上傳
-def upload_paths(engine, account_id: str, paths: list[str], cid: str, conflict: str = KEEP_BOTH) -> dict:
-    """把 NAS 上的檔案/資料夾上傳到 115 的 cid 資料夾。"""
+def upload_paths(engine, account_id: str, paths: list[str], cid: str, conflict: str = KEEP_BOTH,
+                 instant_only: bool = False) -> dict:
+    """把 NAS 上的檔案/資料夾上傳到 115 的 cid 資料夾。
+
+    instant_only=True 時只做秒傳：115 上還沒有相同內容的檔案不會實際上傳（計入 not_instant）。
+    """
     c: CloudClient = engine.client(account_id)
-    stats = {"instant": 0, "uploaded": 0, "skipped": 0, "failed": 0}
+    stats = {"instant": 0, "uploaded": 0, "skipped": 0, "failed": 0, "not_instant": 0}
     listing: dict[str, list[CloudEntry]] = {}
     jobs: list[tuple[str, str, str]] = []  # (本機路徑, 目的 cid, 檔名)
 
@@ -83,6 +89,10 @@ def upload_paths(engine, account_id: str, paths: list[str], cid: str, conflict: 
             engine.db.add_history("", "upload(手動)", path, True, True, h.size, "秒傳")
         else:
             pending.append((path, target, name, h, replace))
+
+    if instant_only:
+        stats["not_instant"] = len(pending)
+        pending = []
 
     def work(job):
         path, target, name, h, replace = job
@@ -166,6 +176,98 @@ def download_entries(engine, account_id: str, items: list[CloudEntry], local_dir
                 log.error("下載失敗：%s", e)
                 stats["failed"] += 1
     return stats
+
+
+# ---------------------------------------------------------------- 本機之間複製／搬移
+def copy_local(engine, paths: list[str], dest_dir: str, conflict: str = KEEP_BOTH, move: bool = False) -> dict:
+    """在本機（NAS）資料夾之間複製或搬移檔案／資料夾。相同內容的檔案不重複複製；覆蓋時舊檔進資源回收筒。"""
+    stats = {"copied": 0, "skipped": 0, "failed": 0}
+    dest_dir = os.path.abspath(dest_dir)
+    jobs: list[tuple[str, str]] = []
+    roots: list[str] = []
+    for p in paths:
+        p = os.path.abspath(p)
+        name = os.path.basename(p.rstrip("\\/"))
+        if os.path.isdir(long_path(p)):
+            if is_inside(p, dest_dir):
+                log.error("不能把資料夾複製到它自己裡面：%s", p)
+                stats["failed"] += 1
+                continue
+            roots.append(p)
+            for root, _dirs, files in os.walk(p):
+                target = os.path.join(dest_dir, name, os.path.relpath(root, p)) if root != p \
+                    else os.path.join(dest_dir, name)
+                os.makedirs(long_path(target), exist_ok=True)
+                jobs += [(os.path.join(root, f), os.path.join(target, f)) for f in files]
+        elif os.path.isfile(long_path(p)):
+            jobs.append((p, os.path.join(dest_dir, name)))
+
+    for src, dest in jobs:
+        engine._check_cancel()
+        try:
+            if os.path.normcase(src) == os.path.normcase(dest):
+                stats["skipped"] += 1
+                continue
+            if os.path.lexists(long_path(dest)):
+                same = os.path.isfile(long_path(dest)) and \
+                    engine.hash_cached(src)[0].sha1 == engine.hash_cached(dest)[0].sha1
+                if same or conflict == SKIP:
+                    stats["skipped"] += 1
+                    if same and move:
+                        os.remove(long_path(src))
+                    continue
+                if conflict == KEEP_BOTH:
+                    dest = os.path.join(os.path.dirname(dest), _stamped(os.path.basename(dest), "複本"))
+                else:
+                    send_to_recycle_bin(dest)
+            size = os.path.getsize(long_path(src))
+            ctrl = engine.transfers.start("copy", "", dest, size, engine.cancel_event)
+            try:
+                if move:
+                    shutil.move(long_path(src), long_path(dest))
+                else:
+                    with open(long_path(src), "rb") as fi, open(long_path(dest), "wb") as fo:
+                        while chunk := fi.read(1024 * 1024):
+                            ctrl.advance(len(chunk))
+                            fo.write(chunk)
+                    shutil.copystat(long_path(src), long_path(dest))
+                ctrl.finish("done")
+            except BaseException as e:
+                ctrl.finish("cancelled" if isinstance(e, Cancelled) else "failed", str(e))
+                if not move and os.path.exists(long_path(dest)):
+                    os.remove(long_path(dest))  # 不留下只複製一半的檔案
+                raise
+            stats["copied"] += 1
+        except Cancelled:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.error("%s失敗：%s → %s：%s", "搬移" if move else "複製", src, dest, e)
+            stats["failed"] += 1
+    if move and not stats["failed"]:
+        for p in roots:  # 來源資料夾內的檔案都搬走了：移除剩下的空資料夾
+            for root, _dirs, _files in os.walk(p, topdown=False):
+                try:
+                    os.rmdir(long_path(root))
+                except OSError:
+                    pass
+    return stats
+
+
+# ---------------------------------------------------------------- 兩個 115 帳號之間
+def transfer_between_accounts(engine, src_account: str, items: list[CloudEntry], dst_account: str, dst_cid: str,
+                              conflict: str = KEEP_BOTH, work_dir: str | None = None) -> dict:
+    """把一個 115 帳號的檔案傳到另一個帳號：先下載到暫存資料夾，再上傳（115 上已有相同內容時是秒傳）。"""
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="nas115sync_transfer_", dir=work_dir)
+    try:
+        down = download_entries(engine, src_account, items, tmp, OVERWRITE)
+        up = upload_paths(engine, dst_account, [os.path.join(tmp, n) for n in sorted(os.listdir(tmp))], dst_cid,
+                          conflict)
+        return {"instant": up["instant"], "uploaded": up["uploaded"], "skipped": up["skipped"],
+                "failed": up["failed"] + down["failed"]}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 比較兩個資料夾

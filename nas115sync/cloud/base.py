@@ -118,6 +118,18 @@ class CloudClient(abc.ABC):
         """cid 底下（含子資料夾）最近修改的檔案，新到舊。不支援時丟出 NotImplementedError。"""
         raise NotImplementedError
 
+    def copy(self, fids: list[str], to_cid: str) -> None:
+        """在同一個帳號內複製到 to_cid（由 115 伺服器複製，不經過本機）。"""
+        raise CloudError("此雲端不支援伺服器端複製")
+
+    def space_info(self) -> tuple[int, int] | None:
+        """(總容量, 已使用) 位元組；無法取得時回傳 None。"""
+        return None
+
+    def path_of(self, cid: str) -> list[tuple[str, str]] | None:
+        """從根目錄走到 cid 的每一層 (cid, 名稱)，不含根目錄；無法取得時回傳 None。"""
+        return None
+
     def user_label(self) -> str:
         return ""
 

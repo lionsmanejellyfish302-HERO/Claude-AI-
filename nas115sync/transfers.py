@@ -60,11 +60,30 @@ class Transfer:
     error: str = ""
     started: float = 0.0
     finished: float = 0.0
+    batch: int = 0  # 所屬的工作（介面的工作清單用）；0 = 背景（即時同步、排程）
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def snapshot(self) -> dict:
         return {k: getattr(self, k) for k in ("id", "kind", "mapping_id", "rel_path", "size", "done", "status",
-                                               "instant", "speed", "error", "started", "finished")}
+                                               "instant", "speed", "error", "started", "finished", "batch")}
+
+
+@dataclass
+class Batch:
+    """使用者啟動的一個工作（例如「上傳 3 個項目」、一次同步）；期間開始的傳輸都歸在它底下。"""
+    id: int
+    kind: str  # upload | download | copy | sync | ...
+    label: str
+    source: str = ""
+    dest: str = ""
+    mapping_ids: frozenset | None = None  # None = 手動傳輸（沒有對應）；否則是這次同步涵蓋的對應
+    status: str = "running"  # running | done | failed | cancelled
+    started: float = 0.0
+    finished: float = 0.0
+
+    def snapshot(self) -> dict:
+        return {k: getattr(self, k) for k in ("id", "kind", "label", "source", "dest", "status", "started",
+                                               "finished")}
 
 
 class TransferManager:
@@ -76,12 +95,15 @@ class TransferManager:
         self.paused = threading.Event()
         self.up_limiter = RateLimiter(upload_kb)
         self.down_limiter = RateLimiter(download_kb)
+        self.no_limiter = RateLimiter(0)  # 本機之間複製不限速
         self.listeners: list[Callable[[dict], None]] = []
+        self._batches: dict[int, Batch] = {}
 
     def start(self, kind: str, mapping_id: str, rel_path: str, size: int,
               global_cancel: threading.Event | None = None) -> "TransferControl":
         t = Transfer(next(self._ids), kind, mapping_id, rel_path, size, status="running", started=time.time())
         with self._lock:
+            t.batch = self._batch_for(mapping_id)
             self._items[t.id] = t
             self._trim()
         self._notify(t)
@@ -91,6 +113,34 @@ class TransferManager:
         finished = [i for i, t in self._items.items() if t.status not in ("queued", "running", "paused")]
         for i in finished[: max(0, len(finished) - self.keep_finished)]:
             del self._items[i]
+
+    # ------------------------------------------------------------ 工作（一批傳輸）
+    def begin_batch(self, kind: str, label: str, source: str = "", dest: str = "",
+                    mapping_ids=None) -> int:
+        """開始一個工作；回傳的編號交給 end_batch。mapping_ids=None 表示手動傳輸。"""
+        b = Batch(next(self._ids), kind, label, source, dest,
+                  None if mapping_ids is None else frozenset(mapping_ids), started=time.time())
+        with self._lock:
+            self._batches[b.id] = b
+        return b.id
+
+    def end_batch(self, batch_id: int, status: str = "done") -> None:
+        with self._lock:
+            b = self._batches.get(batch_id)
+            if b and b.status == "running":
+                b.status, b.finished = status, time.time()
+
+    def batches(self) -> list[dict]:
+        with self._lock:
+            return [b.snapshot() for b in self._batches.values()]
+
+    def _batch_for(self, mapping_id: str) -> int:
+        for b in reversed(list(self._batches.values())):  # 最近開始的優先
+            if b.status == "running" and (
+                    (b.mapping_ids is None and not mapping_id) or
+                    (b.mapping_ids is not None and mapping_id in b.mapping_ids)):
+                return b.id
+        return 0
 
     def _notify(self, t: Transfer) -> None:
         snap = t.snapshot()
@@ -130,6 +180,9 @@ class TransferManager:
         with self._lock:
             for i in [i for i, t in self._items.items() if t.status not in ("queued", "running", "paused")]:
                 del self._items[i]
+            used = {t.batch for t in self._items.values()}
+            for i in [i for i, b in self._batches.items() if b.status != "running" and i not in used]:
+                del self._batches[i]
 
     def set_limits(self, upload_kb: float, download_kb: float) -> None:
         self.up_limiter.set_rate(upload_kb)
@@ -148,6 +201,8 @@ class TransferControl:
 
     @property
     def limiter(self) -> RateLimiter:
+        if self.t.kind == "copy":
+            return self.mgr.no_limiter
         return self.mgr.down_limiter if self.t.kind == "download" else self.mgr.up_limiter
 
     def check(self) -> None:

@@ -158,6 +158,34 @@ class FakeCloud(CloudClient):
                 self._event(6, self.nodes[str(fid)])
             self._save()
 
+    def copy(self, fids: list[str], to_cid: str) -> None:
+        with self._lock:
+            self.api_calls += 1
+            self._dir(to_cid)
+            todo = [(str(f), str(to_cid)) for f in fids]
+            while todo:
+                fid, pid = todo.pop()
+                if fid not in self.nodes:
+                    raise NotFoundError(f"檔案不存在 {fid}")
+                n = dict(self.nodes[fid], fid=self._new_id(), pid=pid)
+                self.nodes[n["fid"]] = n
+                self._event(17 if n["is_dir"] else 2, n)
+                todo.extend((c["fid"], n["fid"]) for c in self._children(fid))
+            self._save()
+
+    def space_info(self) -> tuple[int, int] | None:
+        with self._lock:
+            used = sum(n.get("size", 0) for n in self.nodes.values() if not n["is_dir"])
+            return 1024 ** 4, used  # 模擬 1 TB 的空間
+
+    def path_of(self, cid: str) -> list[tuple[str, str]] | None:
+        with self._lock:
+            out, cur = [], self._dir(cid)
+            while cur["fid"] != "0":
+                out.append((cur["fid"], cur["name"]))
+                cur = self.nodes[cur["pid"]]
+            return out[::-1]
+
     def try_instant(self, local_path: str, cid: str, name: str, hashes: FileHashes) -> UploadResult | None:
         with self._lock:
             self.api_calls += 1

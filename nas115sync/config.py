@@ -63,6 +63,7 @@ class Mapping:
     # 整個對應都是遊戲存檔（例如 NAS 上的「Saved Games」）；每個第一層子資料夾為一個存檔群組
     savedata: bool = False
     note: str = ""
+    name: str = ""  # 顯示在「同步」頁的名稱；空白時用 NAS 資料夾名稱
     direction: str = UPLOAD  # upload / download / two_way
     delete_mode: str = ""  # ""=依全域 deletion_policy；review / auto / ignore
     account_id: str = "default"
@@ -76,6 +77,13 @@ class Mapping:
     @property
     def active(self) -> bool:
         return self.confirmed and self.enabled
+
+    @property
+    def title(self) -> str:
+        if self.name:
+            return self.name
+        parts = [x for x in self.local_path.replace("\\", "/").split("/") if x]
+        return parts[-1] if parts else self.local_path
 
     @property
     def can_upload(self) -> bool:
@@ -141,6 +149,13 @@ class Settings:
     # 雙向/下載模式的存檔群組多久檢查一次 115 是否有新存檔（秒）
     savedata_cloud_poll_seconds: int = 120
     appearance: str = "auto"  # 外觀：auto（跟隨 Windows）／light／dark
+    # 「瀏覽」頁手動傳輸遇到同名但內容不同的檔案：keep_both（保留兩者）／overwrite（覆蓋）／skip（略過）
+    manual_conflict: str = "keep_both"
+    show_hidden: bool = False  # 「瀏覽」頁顯示隱藏檔
+    # 書籤：[{"name","kind":"local"|"cloud","account_id","path"}]
+    bookmarks: list = field(default_factory=list)
+    # 介面狀態（視窗大小、開啟的分頁、檢視方式…），下次開啟時還原
+    ui: dict = field(default_factory=dict)
     # 排程：[{"id","enabled","time":"03:00","days":[0..6],"action":"sync"|"scan","mapping_ids":[]}]
     schedules: list = field(default_factory=list)
 

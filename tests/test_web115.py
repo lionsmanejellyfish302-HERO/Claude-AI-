@@ -326,3 +326,52 @@ def test_changes_returns_only_new_content_events(tmp_path):
     changes, cursor = c.changes(cursor)
     assert [(x.fid, x.kind) for x in changes] == [("303", "22"), ("302", "24")] and cursor == "13"
     assert c.changes(cursor) == ([], "13")
+
+
+# ------------------------------------------------------------------ 瀏覽用：複製、容量、資料夾路徑
+def test_server_side_copy(tmp_path):
+    seen = {}
+
+    def copy(params, data, headers):
+        seen.update(data)
+        return ok()
+
+    c = make(tmp_path, {("POST", "webapi.115.com/files/copy"): copy})
+    c.copy(["11", "22"], "900")
+    assert seen == {"fid[0]": "11", "fid[1]": "22", "pid": "900"}
+    c.copy([], "900")  # 沒有項目：不送出請求
+    assert len(c.session.calls) == 1
+
+
+def test_space_info_tolerates_unexpected_formats(tmp_path):
+    payloads = [
+        {"data": {"space_info": {"all_total": {"size": 5 * 1024 ** 4}, "all_use": {"size": "1099511627776"}}}},
+        {"data": {"space_info": {"all_total": {"size": 100.0}, "all_use": {"size": 250}}}},  # 已用超過總量：夾住
+        {"data": {"space_info": {"all_total": {"size_format": "5TB"}}}},
+        {"data": {}},
+        {"data": []},
+    ]
+    c = make(tmp_path, {("GET", "webapi.115.com/files/index_info"): lambda p, d, h: ok(**payloads.pop(0))})
+    assert c.space_info() == (5 * 1024 ** 4, 1024 ** 4)
+    assert c.space_info() == (100, 100)
+    assert c.space_info() is None and c.space_info() is None and c.space_info() is None
+    c2 = make(tmp_path, {("GET", "webapi.115.com/files/index_info"): lambda p, d, h: Resp(
+        {"state": False, "errno": 20001, "error": "參數錯誤"})})
+    assert c2.space_info() is None  # 查不到容量不影響其他功能
+
+
+def test_path_of_folder(tmp_path):
+    def files(params, data, headers):
+        if str(params["cid"]) == "300":
+            return ok(cid="300", count=0, data=[], path=[
+                {"cid": 0, "name": "根目录"}, {"cid": "100", "name": "備份"}, {"cid": "300", "name": "相片"}])
+        if str(params["cid"]) == "400":
+            return ok(cid="400", count=0, data=[])  # 沒有 path 欄位
+        return ok(cid="0", count=0, data=[])  # 不存在的資料夾：115 靜默回傳根目錄
+
+    c = make(tmp_path, {("GET", "webapi.115.com/files"): files})
+    assert c.path_of("0") == [] and not c.session.calls
+    assert c.path_of("300") == [("100", "備份"), ("300", "相片")]
+    assert c.path_of("400") is None
+    with pytest.raises(NotFoundError):
+        c.path_of("999")

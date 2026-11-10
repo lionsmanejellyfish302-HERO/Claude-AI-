@@ -49,6 +49,7 @@ class MainWindow:
         self._reviews_dirty = False
         self._save_after = None
         self._tasks_user_sized = False
+        self._refresh_panels = False
         self._closed = False
         s = self.config.settings
 
@@ -289,6 +290,7 @@ class MainWindow:
             self.tasks.refresh(force=True)
             self._fit_tasks()
         self.current_batch = bid
+        self._refresh_panels = bool(batch) and batch[0] == "sync"
 
         def target() -> None:
             res, done, status, outcome = None, None, f"{title}失敗", "failed"
@@ -318,6 +320,9 @@ class MainWindow:
         self.cancel_btn.pack_forget()
         self.set_status(status)
         self.refresh_all()
+        if self._refresh_panels:
+            self._refresh_panels = False
+            self.explore.refresh_visible()
         if on_done:
             on_done(res)
 
@@ -516,9 +521,14 @@ class MainWindow:
                                 f"建立資料夾 {stats['mkdirs']} 個", parent=self.root)
 
         ids = [p.mapping_id for p in plans]
-        names = "、".join(m.title for m in (self.config.get_mapping(i) for i in ids) if m)
+        ms = [m for m in (self.config.get_mapping(i) for i in ids) if m]
+        if len(ms) == 1:
+            acct = self.config.get_account(ms[0].account_id)
+            src, dst = ms[0].local_path, f"{acct.label if acct else '115'} {ms[0].cloud_path}"
+        else:
+            src, dst = "、".join(m.title for m in ms), ""
         self.run_bg("同步", lambda: self.engine.execute(plans, progress=self.progress_cb), done,
-                    batch=("sync", "同步", names, ""), mapping_ids=ids)
+                    batch=("sync", "同步", src, dst), mapping_ids=ids)
 
     def export_csv(self) -> None:
         plans = self.engine.last_plans

@@ -20,7 +20,7 @@ from ..cloud.base import CloudEntry
 from ..paths import cloud_norm, long_path, name_key, unsafe_name
 from . import theme
 from .theme import px
-from .util import (AutoScrollbar, fmt_date, human_size, menu_item, open_file, open_local, popup, popup_below, tip)
+from .util import (AutoScrollbar, fmt_date, human_size, menu_item, open_file, open_local, popup, popup_below)
 from .widgets import Breadcrumb, TabStrip, Toggle, tool_button
 
 COMPARE_LABELS = {"same": "＝ 相同", "different": "≠ 不同", "nas_only": "只在本機", "cloud_only": "只在 115"}
@@ -235,6 +235,7 @@ class FilePanel(tk.Frame):
         self._nodes: dict[str, object] = {}
         self._node_of: dict[object, str] = {}
         self._tree_guard = False
+        self._tree_loaded: set[str] = set()  # 已讀過子資料夾的節點
         self._drag = None
         self._press_sel: tuple | None = None
         self._quota: tuple[int, int] | None = None
@@ -326,6 +327,7 @@ class FilePanel(tk.Frame):
             self.pane.forget(self.tree_frame)
 
         t = self.tree
+        t.bind("<Configure>", lambda e: self._fit_columns(), add="+")
         t.bind("<Double-Button-1>", lambda e: self.open_selected())
         t.bind("<Return>", lambda e: self.open_selected())
         t.bind("<BackSpace>", lambda e: self.go_up())
@@ -357,11 +359,12 @@ class FilePanel(tk.Frame):
     def _show_columns(self) -> None:
         shown = self.win.config.settings.ui.get("columns") or {}
         cols = [c for c in ("size", "date") if shown.get(c, True)]
-        if self.source.kind == "cloud" and shown.get("sha1", True):
+        if self.source.kind == "cloud" and shown.get("sha1", False):
             cols.append("sha1")
         if self.compare:
             cols.append("cmp")
         self.tree.configure(displaycolumns=cols)
+        self._fit_columns()
 
     # ------------------------------------------------------------ 導覽
     def go(self, place, record: bool = True, follow: bool = True, select: str | None = None) -> None:
@@ -392,7 +395,7 @@ class FilePanel(tk.Frame):
             try:
                 items = src.list(place, hidden)
             except Exception as e:  # noqa: BLE001
-                self.win.ui.call(lambda: (self._set_busy(-1), failed(e)))
+                self.win.ui.call(lambda err=e: (self._set_busy(-1), failed(err)))
                 return
             self.win.ui.call(lambda: (self._set_busy(-1), done(items)))
 
@@ -411,7 +414,7 @@ class FilePanel(tk.Frame):
             try:
                 place = src.resolve(text)
             except Exception as e:  # noqa: BLE001
-                self.win.ui.call(lambda: (self._set_busy(-1), self._error("無法開啟", e)))
+                self.win.ui.call(lambda err=e: (self._set_busy(-1), self._error("無法開啟", err)))
                 return
             self.win.ui.call(lambda: (self._set_busy(-1), self.go(place)))
 
@@ -598,11 +601,22 @@ class FilePanel(tk.Frame):
         self.page.quota_cache.pop(self.source.account_id, None)
         self._update_quota()
 
+    def _fit_columns(self) -> None:
+        """名稱欄吸收剩下的寬度：面板變窄時先縮名稱欄，大小與日期才不會被擠出畫面。"""
+        t = self.tree
+        shown = t.cget("displaycolumns")
+        cols = list(t.cget("columns")) if "#all" in shown else list(shown)
+        rest = sum(int(t.column(c, "width")) for c in cols)
+        want = max(px(120), t.winfo_width() - rest - 2)
+        if t.winfo_width() > 1 and abs(int(t.column("#0", "width")) - want) > 1:
+            t.column("#0", width=want)
+
     # ------------------------------------------------------------ 資料夾樹
     def _tree_reset(self) -> None:
         self.ftree.delete(*self.ftree.get_children())
         self._nodes.clear()
         self._node_of.clear()
+        self._tree_loaded.clear()
         self._images = [theme.icon(self.source.icon)]
         root = self.source.root
         iid = self.ftree.insert("", "end", text=" " + self.source.title, image=self._images[0], open=True)
@@ -623,11 +637,15 @@ class FilePanel(tk.Frame):
         ft = self.ftree
         if not ft.exists(iid):
             return
+        self._tree_loaded.add(iid)
         keep = set()
         for it in sorted(dirs, key=lambda d: name_key(d.name)):
             child = self.source.child(place, it)
             keep.add(self._tree_node(iid, child, it.name, it.icon))
+        on_path = {pl for _label, pl in self.source.crumbs(self.place)}  # 目前所在的那一支不能刪（例如隱藏資料夾）
         for kid in ft.get_children(iid):
+            if kid not in keep and self._nodes.get(kid) in on_path:
+                keep.add(kid)
             if kid not in keep:
                 for sub in self._descendants(kid):
                     self._node_of.pop(self._nodes.pop(sub, None), None)
@@ -653,7 +671,12 @@ class FilePanel(tk.Frame):
         iid = self._node_of[crumbs[0][1]]
         for label, pl in crumbs[1:]:
             ft.item(iid, open=True)
-            iid = self._tree_node(iid, pl, label, "drive" if self.source.kind == "local" and pl == crumbs[1][1] else None)
+            parent = iid
+            iid = self._tree_node(parent, pl, label, "drive" if self.source.kind == "local" and pl == crumbs[1][1] else None)
+            if ft.exists(parent + "_x"):
+                ft.delete(parent + "_x")
+            if parent not in self._tree_loaded:  # 上層只有這一支：在背景補上同一層的其他資料夾
+                self._tree_load(parent)
         self._tree_fill(iid, place, dirs)
         ft.item(iid, open=True)
         self._tree_guard = True
@@ -665,27 +688,32 @@ class FilePanel(tk.Frame):
 
     def _tree_open(self, _event=None) -> None:
         iid = self.ftree.focus()
+        if iid in self._nodes and iid not in self._tree_loaded:
+            self._tree_load(iid)
+
+    def _tree_load(self, iid: str) -> None:
+        """在背景讀取一個節點底下的資料夾。"""
         place = self._nodes.get(iid)
-        if place is None or not self.ftree.exists(iid + "_x"):
+        if place is None:
             return
+        self._tree_loaded.add(iid)
         src, hidden = self.source, bool(self.page.hidden_var.get())
 
         def fill(items) -> None:
-            if self.source is src and self.ftree.exists(iid):
-                self._tree_fill(iid, place, [it for it in items if it.is_dir])
-
-        if src.kind == "local":
-            try:
-                fill(src.list(place, hidden))
-            except OSError:
-                fill([])
-            return
+            if self.source is not src or not self.winfo_exists() or not self.ftree.exists(iid):
+                return
+            if items is None:  # 讀不到：下次展開時再試
+                self._tree_loaded.discard(iid)
+                if self.ftree.exists(iid + "_x") and len(self.ftree.get_children(iid)) > 1:
+                    self.ftree.delete(iid + "_x")
+                return
+            self._tree_fill(iid, place, [it for it in items if it.is_dir])
 
         def work() -> None:
             try:
                 items = src.list(place, hidden)
             except Exception:  # noqa: BLE001
-                items = []
+                items = None
             self.win.ui.call(lambda: fill(items))
 
         threading.Thread(target=work, daemon=True).start()
@@ -707,6 +735,7 @@ class FilePanel(tk.Frame):
         self.btn_loc.configure(image=theme.icon_pair(source.icon))
         self._nodes.clear()
         self._node_of.clear()
+        self._tree_loaded.clear()
         self.ftree.delete(*self.ftree.get_children())
         self.place = source.root
         self.go(place if place is not None else source.root, follow=False)
@@ -773,7 +802,7 @@ class FilePanel(tk.Frame):
 
         def flip(col: str) -> None:
             cur = dict(ui.get("columns") or {})
-            cur[col] = not cur.get(col, True)
+            cur[col] = not cur.get(col, col != "sha1")
             ui["columns"] = cur
             self.win.save_ui()
             self.page.each_panel(lambda p: p._show_columns())
@@ -785,7 +814,7 @@ class FilePanel(tk.Frame):
         cur = self.win.config.settings.manual_conflict
         return [{"label": "顯示「大小」", "check": shown.get("size", True), "command": lambda: flip("size")},
                 {"label": "顯示「日期」", "check": shown.get("date", True), "command": lambda: flip("date")},
-                {"label": "顯示「SHA-1」（115）", "check": shown.get("sha1", True), "command": lambda: flip("sha1")},
+                {"label": "顯示「SHA-1」（115）", "check": shown.get("sha1", False), "command": lambda: flip("sha1")},
                 None,
                 {"label": "同名但內容不同時", "icon": "conflict", "submenu": [
                     {"label": label, "check": mode == cur, "command": lambda m=mode: conflict(m)}
@@ -896,7 +925,7 @@ class FilePanel(tk.Frame):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
-                self.win.ui.call(lambda: (self._set_busy(-1), self._error(title + "失敗", e)))
+                self.win.ui.call(lambda err=e: (self._set_busy(-1), self._error(title + "失敗", err)))
                 return
             self.page.quota_cache.pop(self.source.account_id, None)
             self.win.ui.call(lambda: (self._set_busy(-1), self.go(self.place, record=False, follow=False, select=select)))
@@ -1271,6 +1300,12 @@ class ExplorePage(ttk.Frame):
     def groups(self) -> list[PanelGroup]:
         n = {"one": 1, "two": 2, "four": 4}[self.view]
         return [g for pair in self.pairs for g in (pair.left, pair.right)][:n]
+
+    def refresh_visible(self) -> None:
+        """重新讀取畫面上看得到的面板（同步完成後兩邊的內容都可能變了）。"""
+        for g in self.groups():
+            if isinstance(g.active, FilePanel):
+                g.active.refresh()
 
     def each_panel(self, fn) -> None:
         for pair in self.pairs:

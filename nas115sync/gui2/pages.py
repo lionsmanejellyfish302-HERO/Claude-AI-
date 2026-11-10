@@ -173,7 +173,7 @@ def _quota_bar(parent, used: float, total: float, width: int = 150) -> tk.Canvas
     frac = max(0.0, min(1.0, used / total)) if total else 0.0
     c.create_rectangle(0, 0, w, h, fill=p.trough, outline="")
     if frac:
-        c.create_rectangle(0, 0, max(2, round(w * frac)), h, fill=p.danger if frac > 0.9 else p.progress, outline="")
+        c.create_rectangle(0, 0, max(2, round(w * frac)), h, fill=p.danger if frac > 0.9 else p.accent, outline="")
     return c
 
 
@@ -354,7 +354,7 @@ class AccountsPage(ttk.Frame):
                 return
             info = self.info.get(a.id, {"state": "loading", "name": "讀取中…", "space": None})
             ttk.Label(d, text=a.label, style="Big.TLabel", image=theme.icon("cloud", 24), compound="left").pack(anchor="w")
-            rows = [("服務", "115 網盤（與 115 電腦版相同的登入方式）"), ("狀態", info["name"])]
+            rows = [("服務", "115 網盤"), ("狀態", info["name"])]
             if info["space"]:
                 total, used = info["space"]
                 rows += [("容量", human_size(total)), ("已使用", human_size(used)),

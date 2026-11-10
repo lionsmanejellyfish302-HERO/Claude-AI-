@@ -202,11 +202,15 @@ class GridList(ttk.Frame):
     def _fit_widths(self) -> None:
         """讓 stretch 欄吸收多出來（或不足）的寬度。"""
         avail = self.canvas.winfo_width()
-        for i, col in enumerate(self.columns):
-            if col.stretch and avail > 1:
-                others = sum(w for j, w in enumerate(self._widths) if j != i)
-                self._widths[i] = max(px(col.width), avail - others)
-                break
+        idx = [i for i, col in enumerate(self.columns) if col.stretch]
+        if not idx or avail <= 1:
+            return
+        fixed = sum(w for j, w in enumerate(self._widths) if j not in idx)
+        each = max(px(110), (avail - fixed) // len(idx))
+        for i in idx:
+            self._widths[i] = each
+        if each * len(idx) + fixed < avail:  # 除不盡的幾個像素給第一欄
+            self._widths[idx[0]] += avail - fixed - each * len(idx)
 
     def _draw(self) -> None:
         self._pending = False

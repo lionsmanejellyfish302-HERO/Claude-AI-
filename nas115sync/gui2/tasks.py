@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 from tkinter import ttk
 
 from ..paths import cloud_join, local_join
@@ -24,7 +25,8 @@ ACTIVE = ("queued", "running", "paused")
 def _place_icon(text: str) -> str:
     """來源／目的文字是本機路徑還是 115：本機路徑有磁碟機代號、UNC 或以 / 開頭。"""
     t = text.strip()
-    return "computer" if (t[1:3] == ":\\" or t.startswith(("\\\\", "/")) or t == "本機") else "cloud"
+    return "computer" if (t[1:3] == ":\\" or t.startswith("\\\\") or (os.sep == "/" and t.startswith("/"))
+                          or t == "本機") else "cloud"
 
 
 class TaskArea(ttk.Frame):
@@ -118,7 +120,8 @@ class TaskArea(ttk.Frame):
         op = ("bolt", "秒傳") if t["instant"] and kind == "upload" else (KIND_ICON.get(kind, "upload"),
                                                                       KIND_LABEL.get(kind, kind))
         return {"id": ("t", t["id"]), "fg": theme.P.danger if t["status"] == "failed" else None,
-                "cells": {"op": op, "src": (icons.file_icon_name(name), src), "dst": (_place_icon(dst), dst),
+                "cells": {"op": op, "src": (icons.file_icon_name(name), src),
+                          "dst": ({"upload": "cloud", "download": "computer"}.get(kind) or _place_icon(dst), dst),
                           "status": (icon, label), "size": f"{human_size(done)} / {human_size(size)}",
                           "prog": (frac, f"{int(frac * 100)}%", state),
                           "speed": f"{human_size(t['speed'])}/s" if running and t["speed"] else "", "eta": eta}}
@@ -170,7 +173,8 @@ class TaskArea(ttk.Frame):
                 size = ""
             rows.append({"id": h["gid"], "children": kids, "cells": {
                 "op": (KIND_ICON.get(h["kind"], "sync"), h["label"]),
-                "src": (_place_icon(h["src"]), h["src"]) if h["src"] else (None, ""),
+                "src": (None if not h["dst"] and h["kind"] == "sync" else _place_icon(h["src"]), h["src"])
+                if h["src"] else (None, ""),
                 "dst": (_place_icon(h["dst"]), h["dst"]) if h["dst"] else (None, ""),
                 "status": st, "size": size, "prog": prog,
                 "speed": f"{human_size(speed)}/s" if speed else "",

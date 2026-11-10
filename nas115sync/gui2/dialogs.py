@@ -1,7 +1,6 @@
 """對話框與「同步」視窗（比照 Air Explorer 的 Windows 對話框：淺灰底、右下角「確定／取消」）。"""
 from __future__ import annotations
 
-import os
 import threading
 import time
 import tkinter as tk
@@ -1045,7 +1044,7 @@ class SyncWindow(tk.Toplevel):
 
         cols = [Column("lp", "路徑（NAS）", 300, stretch=True), Column("ls", "大小", 84, anchor="e"),
                 Column("ld", "日期", 128), Column("act", "", 40, "icon", "center"),
-                Column("rp", "路徑（115）", 300), Column("rs", "大小", 84, anchor="e"), Column("rd", "日期", 128),
+                Column("rp", "路徑（115）", 300, stretch=True), Column("rs", "大小", 84, anchor="e"), Column("rd", "日期", 128),
                 Column("st", "狀態", 190)]
         self.grid_list = GridList(self, cols, render=self._render, row_id=lambda r: r[0], on_open=self._open_row,
                                   on_menu=self._menu)

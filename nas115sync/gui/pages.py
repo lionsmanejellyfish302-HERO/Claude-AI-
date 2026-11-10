@@ -195,6 +195,7 @@ class AccountsPage(ttk.Frame):
         super().__init__(parent)
         self.win, self.config, self.engine = win, win.config, win.engine
         self.info: dict[str, dict] = {}  # 帳號 ID → {"state": demo/on/off/error, "name", "space"}
+        self.nas_info: dict[str, tuple | None] = {}  # NAS 資料夾 → (總容量, 已使用, 可用)；讀不到是 None
         self._loading: set[str] = set()
         bar = Bar(self)
         bar.pack(fill="x")
@@ -232,6 +233,7 @@ class AccountsPage(ttk.Frame):
 
     def reload(self) -> None:
         self.info.clear()
+        self.nas_info.clear()
         self.win.explore.quota_cache.clear()
         self.refresh()
 
@@ -270,6 +272,29 @@ class AccountsPage(ttk.Frame):
         if self.winfo_exists():
             self.info[aid] = info
             self._fill()
+
+    def _load_nas(self, path: str) -> None:
+        """NAS 的容量在背景讀取：NAS 離線時 Windows 要等很久才會回應，不能卡住畫面。"""
+        key = "n:" + path
+        if key in self._loading:
+            return
+        self._loading.add(key)
+
+        def work() -> None:
+            try:
+                du = shutil.disk_usage(path)
+                usage: tuple | None = (du.total, du.used, du.free)
+            except OSError:
+                usage = None
+            self.win.ui.call(done, usage)
+
+        def done(usage) -> None:
+            self._loading.discard(key)
+            if self.winfo_exists():
+                self.nas_info[path] = usage
+                self._fill()
+
+        threading.Thread(target=work, daemon=True).start()
 
     def nas_folders(self) -> dict[str, list]:
         """所有同步用到的 NAS 資料夾 → 使用它的同步。"""
@@ -323,12 +348,15 @@ class AccountsPage(ttk.Frame):
                 _lbl(head, f"NAS 資料夾　{len(ms)} 組同步使用", fg=p.text2).pack(side="left", padx=(px(10), 0))
                 row = tk.Frame(box, background=p.bg)
                 row.pack(fill="x", pady=(px(5), 0))
-                try:
-                    du = shutil.disk_usage(path)
-                    _lbl(row, f"容量　{human_size(du.total)}　　可用　{human_size(du.free)}").pack(side="left")
-                    _quota_bar(row, du.used, du.total).pack(side="left", padx=(px(12), 0))
-                except OSError:
+                if path not in self.nas_info:
+                    self._load_nas(path)
+                    _lbl(row, "讀取中…", fg=p.text2).pack(side="left")
+                elif self.nas_info[path] is None:
                     _lbl(row, "目前無法讀取（NAS 離線或路徑不存在）", fg=p.danger).pack(side="left")
+                else:
+                    total, used, free = self.nas_info[path]
+                    _lbl(row, f"容量　{human_size(total)}　　可用　{human_size(free)}").pack(side="left")
+                    _quota_bar(row, used, total).pack(side="left", padx=(px(12), 0))
         self.cards.finish()
         self._show_detail()
 

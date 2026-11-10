@@ -1317,11 +1317,16 @@ class ExplorePage(ttk.Frame):
     def set_view(self, view: str) -> None:
         self.view = view
         for pair in self.pairs:
-            pair.pack_forget()
+            pair.grid_forget()
         self.pairs[0].single(view == "one")
-        self.pairs[0].pack(fill="both", expand=True, padx=px(4), pady=(px(2), px(2)))
-        if view == "four":
-            self.pairs[1].pack(fill="both", expand=True, padx=px(4), pady=(0, px(2)))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1, uniform="pairs")
+        self.pairs[0].grid(row=0, column=0, sticky="nsew", padx=px(4), pady=px(2))
+        if view == "four":  # 上下兩組面板一樣高
+            self.rowconfigure(1, weight=1, uniform="pairs")
+            self.pairs[1].grid(row=1, column=0, sticky="nsew", padx=px(4), pady=(0, px(2)))
+        else:
+            self.rowconfigure(1, weight=0, uniform="")
         self.remember()
 
     def _default_tabs(self, group_name: str) -> list[dict]:

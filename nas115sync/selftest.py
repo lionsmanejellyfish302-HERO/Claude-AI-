@@ -294,9 +294,12 @@ def _gui(ctx: dict, out_dir: str, tab_seconds: float) -> dict:
     try:
         root.update()
         open(os.path.join(out_dir, "gui_ready"), "w").close()
-        for i, tab in enumerate(win.nb.tabs()):
-            win.nb.select(tab)
-            titles.append(win.nb.tab(tab, "text"))
+        # 主工具列的每一頁都開一次（tab_NN 檔案是給外部截圖用的記號）
+        for i, name in enumerate(("explore", "accounts", "search", "sync", "scheduler", "reviews", "savedata",
+                                  "dupes", "log")):
+            win.show_page(name)
+            _check(win.pages.current == name, f"頁面沒有切換：{name}")
+            titles.append(name)
             root.update()
             if tab_seconds:
                 open(os.path.join(out_dir, f"tab_{i:02d}"), "w").close()
@@ -304,8 +307,8 @@ def _gui(ctx: dict, out_dir: str, tab_seconds: float) -> dict:
                 while time.time() < end:
                     root.update()
                     time.sleep(0.05)
-        _check(len(titles) >= 9, f"分頁數量不對：{titles}")
-        # 依序按下每個分頁的每個按鈕（對話框自動回答），全程不可出現錯誤
+        _check(len(titles) >= 9, f"頁面數量不對：{titles}")
+        # 依序操作每一頁的每個按鈕與選單（對話框自動回答），全程不可出現錯誤
         result = exercise.run(win, os.path.join(os.path.dirname(ctx["nas"]), "介面演練"))
     finally:
         win.scheduler.stop()
